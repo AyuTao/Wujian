@@ -1,0 +1,106 @@
+name: Beta packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beta-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - os: macos-14
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.3
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: beta-${{ matrix.target }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - name: Build beta installers
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+      - name: Collect packages and SHA-256
+        shell: python
+        run: |
+          import hashlib, pathlib, shutil
+          root = pathlib.Path('src-tauri/target/${{ matrix.target }}/release/bundle')
+          out = pathlib.Path('beta-packages')
+          out.mkdir()
+          packages = [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in {'.dmg', '.exe', '.deb', '.appimage'}]
+          if not packages:
+              raise SystemExit('No packages produced')
+          for p in packages:
+              name = '${{ matrix.target }}-' + p.name
+              target = out / name
+              shutil.copy2(p, target)
+              (out / (name + '.sha256')).write_text(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name + '\n', encoding='utf-8')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beta-${{ matrix.target }}
+          path: beta-packages/*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: beta-*
+          merge-multiple: true
+          path: beta-packages
+      - name: Create or update draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+            gh release upload "$tag" beta-packages/* --clobber
+          else
+            gh release create "$tag" beta-packages/* --target "$GITHUB_SHA" --draft --prerelease --title "Wujian $version" --notes-file docs/测试版发布说明.md
+          fi

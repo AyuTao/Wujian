@@ -1,0 +1,27 @@
+[package]
+name = "wujian"
+default-run = "wujian"
+version = "0.1.0-beta.1"
+description = "Local AI tool network inspection assistant"
+authors = ["Wujian contributors"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/AyuTao/Wujian"
+
+[lib]
+name = "wujian_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt", "net", "macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+maxminddb = { version = "0.32.0", default-features = false }

@@ -1,0 +1,123 @@
+@charset "UTF-8";
+:root {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  color: #182134;
+  background: #f6f8fc;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #f6f8fc;
+  --surface: #fff;
+  --text: #182134;
+  --muted: #56657a;
+  --line: #d8e0ec;
+  --subtle: #eef2f8;
+  --brand: #3056d3;
+  --brand-soft: #edf1fe;
+  --brand-text: #fff;
+  --success: #12745c;
+  --warning: #a85d0a;
+  --danger: #bd3546;
+  --shadow: 0 12px 40px #18213418;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --bg: #141b28;
+  --surface: #1c2636;
+  --text: #edf2fa;
+  --muted: #b3c0d2;
+  --line: #42516a;
+  --subtle: #253145;
+  --brand: #9aaeff;
+  --brand-soft: #283a62;
+  --brand-text: #182134;
+  --success: #73d7b5;
+  --warning: #f0bc73;
+  --danger: #ff9aa7;
+  --shadow: 0 16px 40px #0005;
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: dark;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 360px;
+}
+button,
+input,
+select {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+button,
+a,
+input,
+select {
+  -webkit-tap-highlight-color: transparent;
+}
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 3px;
+}
+button {
+  color: inherit;
+}
+input,
+select {
+  color: var(--text);
+}
+button svg {
+  flex-shrink: 0;
+}
+a {
+  color: var(--brand);
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+button {
+  border: 0;
+}
+::selection {
+  background: #3056d333;
+}
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+#root {
+  min-height: 100vh;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

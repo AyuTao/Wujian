@@ -1,0 +1,601 @@
+/* ========================================================================= */
+/* 《無間道》· 潜入美国做AI卧底 (400x600 极简极客版) */
+/* ========================================================================= */
+.screen {
+  width: 100vw;
+  height: 100dvh;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  position: relative;
+  background: radial-gradient(
+    circle at 50% 15%,
+    #0b1528 0%,
+    #030710 70%,
+    #010307 100%
+  );
+  color: #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+  font-family:
+    ui-monospace,
+    "SF Mono",
+    "JetBrains Mono",
+    Menlo,
+    -apple-system,
+    sans-serif;
+  box-sizing: border-box;
+}
+
+/* 顶部单行标题条 (44px) */
+.topNav {
+  height: 44px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  background: rgba(8, 14, 26, 0.95);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.18);
+  box-shadow: 0 1px 10px rgba(0, 0, 0, 0.6);
+  z-index: 10;
+}
+
+.brandRow {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.brandTitle {
+  margin: 0;
+  font-size: 16.5px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: #ffffff;
+  text-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
+  font-family: "PingFang SC", "Source Han Serif SC", "Songti SC", serif;
+  line-height: 1;
+}
+
+.brandDivider {
+  font-size: 13px;
+  color: #64748b;
+  font-weight: 500;
+  opacity: 0.7;
+}
+
+.brandSub {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #38bdf8;
+  letter-spacing: 1px;
+  text-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
+  font-family: "PingFang SC", "Source Han Serif SC", "Songti SC", serif;
+  line-height: 1;
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.statusBadge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 2px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+.badgePass {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #34d399;
+}
+
+.badgeWarn {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+}
+
+.badgeArmed {
+  background: rgba(56, 189, 248, 0.18);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  color: #38bdf8;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.25);
+}
+
+.btnIconReload {
+  background: transparent;
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  color: #94a3b8;
+  border-radius: 3px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s ease;
+}
+
+.btnIconReload:hover:not(:disabled) {
+  border-color: #38bdf8;
+  color: #38bdf8;
+  box-shadow: 0 0 6px rgba(56, 189, 248, 0.3);
+}
+
+/* 400x600 紧凑单屏容器 */
+.container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 12px 14px 14px 14px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* 6 行卡片列表 (总高 ~320px) */
+.cardsContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.itemCardRow {
+  background: rgba(11, 19, 36, 0.75);
+  border: 1px solid rgba(56, 189, 248, 0.14);
+  border-radius: 3px;
+  padding: 0 12px;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: all 0.2s ease;
+  box-sizing: border-box;
+}
+
+.itemCardRow:hover {
+  background: rgba(15, 26, 49, 0.95);
+  border-color: rgba(56, 189, 248, 0.35);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.12);
+}
+
+.rowPass {
+  border-left: 3.5px solid #10b981;
+}
+
+.rowFail {
+  border-left: 3.5px solid #ef4444;
+}
+
+.rowColTitle {
+  width: 40px;
+  flex-shrink: 0;
+  font-size: 12.5px;
+  font-weight: 800;
+  color: #94a3b8;
+  letter-spacing: 0.5px;
+}
+
+.rowColData {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  overflow: hidden;
+}
+
+.dataPassColor {
+  color: #38bdf8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dataFailColor {
+  color: #f87171;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowColAction {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.btnGateToggle {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.06);
+  color: #cbd5e1;
+  transition: all 0.2s ease;
+  font-family: inherit;
+}
+
+.btnGateToggle:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.btnGateActive {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #ffffff;
+  box-shadow: 0 0 8px rgba(2, 132, 199, 0.4);
+}
+
+.btnGateActive:hover:not(:disabled) {
+  background: #0369a1;
+}
+
+/* PASS 鲜红钢印章 */
+.rowColStamp {
+  width: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.redStampPass {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: Impact, "Arial Black", ui-monospace, sans-serif;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 1.5px;
+  color: #ef4444;
+  border: 1.5px solid #ef4444;
+  border-radius: 2px;
+  padding: 1px 5px;
+  text-transform: uppercase;
+  transform: rotate(-8deg);
+  box-shadow:
+    0 0 8px rgba(239, 68, 68, 0.35),
+    inset 0 0 5px rgba(239, 68, 68, 0.2);
+  text-shadow: 0 0 4px rgba(239, 68, 68, 0.6);
+  user-select: none;
+  background: rgba(239, 68, 68, 0.08);
+  line-height: 1.1;
+}
+
+.stampPending {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: Impact, "Arial Black", ui-monospace, sans-serif;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: #64748b;
+  border: 1px dashed rgba(100, 116, 139, 0.45);
+  border-radius: 2px;
+  padding: 1px 4px;
+  text-transform: uppercase;
+  transform: rotate(-4deg);
+  user-select: none;
+  line-height: 1.1;
+  opacity: 0.6;
+}
+
+/* 底部操作区 (总高 ~125px) */
+.controlArea {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+  padding-top: 6px;
+}
+
+.primaryActionBtn {
+  width: 100%;
+  padding: 11px 14px;
+  border: none;
+  border-radius: 3px;
+  font-size: 13.5px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.25s ease;
+  font-family: inherit;
+}
+
+.primaryReady {
+  background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+  color: #ffffff;
+  box-shadow: 0 0 16px rgba(2, 132, 199, 0.4);
+}
+
+.primaryReady:hover:not(:disabled) {
+  background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+  box-shadow: 0 0 20px rgba(14, 165, 233, 0.6);
+}
+
+.primaryProtecting {
+  background: linear-gradient(135deg, #059669 0%, #047857 100%);
+  color: #ffffff;
+  box-shadow: 0 0 16px rgba(5, 150, 105, 0.4);
+}
+
+.primaryWarn {
+  background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+  color: #ffffff;
+  box-shadow: 0 0 16px rgba(220, 38, 38, 0.4);
+}
+
+.dualTools {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.btnOptimize {
+  background: rgba(234, 179, 8, 0.12);
+  border: 1px solid rgba(234, 179, 8, 0.35);
+  color: #facc15;
+  border-radius: 3px;
+  padding: 7px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.btnOptimize:hover:not(:disabled) {
+  background: rgba(234, 179, 8, 0.22);
+  box-shadow: 0 0 10px rgba(234, 179, 8, 0.3);
+}
+
+.btnRestore {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #cbd5e1;
+  border-radius: 3px;
+  padding: 7px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.btnRestore:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.09);
+  color: #ffffff;
+}
+
+.bottomAux {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 4px;
+}
+
+.auxLink {
+  color: #64748b;
+  font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.auxLink:hover {
+  color: #38bdf8;
+}
+
+.btnAuxExit {
+  background: transparent;
+  border: none;
+  color: #f87171;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  opacity: 0.8;
+  font-family: inherit;
+  transition: opacity 0.2s;
+}
+
+.btnAuxExit:hover:not(:disabled) {
+  opacity: 1;
+}
+
+/* 浮动提示 */
+.topToast {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(153, 27, 27, 0.95);
+  backdrop-filter: blur(8px);
+  border: 1px solid #ef4444;
+  color: #ffffff;
+  padding: 6px 14px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  z-index: 9999;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.7);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.bottomFeedback {
+  position: fixed;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(8, 14, 26, 0.95);
+  backdrop-filter: blur(8px);
+  border: 1px solid #38bdf8;
+  color: #38bdf8;
+  padding: 5px 12px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  font-weight: 600;
+  z-index: 9999;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.6);
+  white-space: nowrap;
+}
+
+/* 检测详情和恢复错误需要在小窗口中保持可访问。 */
+.container {
+  overflow-y: auto;
+  justify-content: flex-start;
+  gap: 14px;
+}
+.brandSub {
+  font-size: 11px;
+}
+.statusPanel,
+.settingsPanel {
+  padding: 10px;
+  border: 1px solid #29415b;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.statusPanel p,
+.settingsPanel p,
+.checkDetail p {
+  margin: 7px 0;
+  overflow-wrap: anywhere;
+}
+.statusPanel strong {
+  color: #7dd3fc;
+}
+.errorPanel {
+  color: #fca5a5;
+  padding: 10px;
+  border: 1px solid #7f1d1d;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.notice {
+  font-size: 12px;
+  color: #7dd3fc;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.settingsPanel summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.settingsPanel form {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+.settingsPanel label {
+  display: block;
+}
+.settingsPanel input:not([type="checkbox"]) {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  padding: 7px;
+  box-sizing: border-box;
+  background: #0b1528;
+  border: 1px solid #3e526e;
+  color: #e2e8f0;
+  border-radius: 3px;
+}
+.settingsPanel input[type="checkbox"] {
+  margin-right: 8px;
+}
+.checkDetail {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.checkDetail p {
+  padding: 0 10px;
+  color: #a8b7cd;
+}
+.checkDetail summary {
+  cursor: pointer;
+  list-style: none;
+}
+.rowColTitle {
+  width: 80px;
+  font-size: 11px;
+}
+.rowColData {
+  font-size: 11px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  display: block;
+}
+.logPreview {
+  max-height: 180px;
+  overflow: auto;
+  font-size: 10px;
+  user-select: text;
+}
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  background: #000c;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 16px;
+}
+.modal {
+  background: #0b1528;
+  border: 1px solid #3e526e;
+  padding: 22px;
+  border-radius: 6px;
+  max-width: 480px;
+  max-height: 85vh;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.modal h3 {
+  margin-top: 0;
+  color: #7dd3fc;
+}
+.modal p {
+  white-space: pre-line;
+}
+.bottomAux {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.screen button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.screen button:focus-visible,
+.screen summary:focus-visible,
+.screen input:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 3px;
+}

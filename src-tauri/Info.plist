@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>NSAppleEventsUsageDescription</key><string>仅在你点击启动工具后，使用系统终端打开所选 AI 命令行工具。</string></dict></plist>

@@ -1,0 +1,105 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev nftables iproute2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.3
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check frontend types
+        run: pnpm typecheck
+
+      - name: Test frontend
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Check Rust
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Export cross-platform firewall fixture
+        run: cargo run --manifest-path src-tauri/Cargo.toml --locked --bin wujian-firewall -- fixture "${{ runner.temp }}/wujian-firewall-fixture"
+
+      - name: Parse macOS PF rules without loading
+        if: runner.os == 'macOS'
+        run: /sbin/pfctl -n -a com.apple/000.io.wujian -f "${{ runner.temp }}/wujian-firewall-fixture/macos.conf"
+
+      - name: Linux isolated packet and recovery test
+        if: runner.os == 'Linux'
+        run: sudo unshare --net -- python3 tests/native/linux-firewall.py src-tauri/target/debug/wujian-firewall "${{ runner.temp }}/wujian-firewall-fixture"
+
+      - name: Validate Windows script and address parameters without applying
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = Join-Path $env:RUNNER_TEMP 'wujian-firewall-fixture'
+          $tokens = $null
+          $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $fixture 'windows.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+          $addresses = @(Get-Content (Join-Path $fixture 'denied-networks.json') -Raw | ConvertFrom-Json)
+          for ($i = 0; $i -lt $addresses.Count; $i += 128) {
+            $end = [Math]::Min($i + 127, $addresses.Count - 1)
+            New-NetFirewallRule -Name 'Wujian-CI-Validate' -DisplayName 'Wujian-CI-Validate' -Direction Outbound -Action Block -RemoteAddress $addresses[$i..$end] -WhatIf | Out-Null
+          }
+
+      - name: Test macOS packet decisions
+        if: runner.os == 'macOS'
+        run: swift test --package-path native/macos/GuardCore
+
+      - name: Typecheck macOS filter and host
+        if: runner.os == 'macOS'
+        run: python3 native/macos/build.py --typecheck-only

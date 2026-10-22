@@ -1,0 +1,27 @@
+node_modules/
+dist/
+src-tauri/target/
+.DS_Store
+*.local
+work/
+src-tauri/gen/schemas/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# Native filter local build and local GeoIP-derived data
+native/macos/build/
+native/macos/GuardCore/.build/
+
+__pycache__/
+
+# Never publish local credentials, diagnostics or third-party databases
+.env
+.env.*
+*.mmdb
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.key
+logs/
+reports/
