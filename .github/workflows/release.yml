@@ -76,7 +76,7 @@ jobs:
               if target.exists():
                   raise SystemExit('Duplicate package name: ' + name)
               shutil.copy2(p, target)
-              (out / (name + '.sha256')).write_text(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name + '\n', encoding='utf-8', newline='\n')
+              (out / (name + '.sha256')).write_bytes((hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name + '\n').encode('utf-8'))
       - uses: actions/upload-artifact@v4
         with:
           name: beta-${{ matrix.target }}
