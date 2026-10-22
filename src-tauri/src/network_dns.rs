@@ -200,16 +200,17 @@ async fn capture() -> Result<Vec<Backup>, String> {
     #[cfg(target_os = "windows")]
     {
         let script = r#"$a=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | ForEach-Object {
-            $p='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\'+$_.InterfaceGuid.ToString('B');
+            $guid=[guid]$_.InterfaceGuid;
+            $p='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\'+$guid.ToString('B');
             $raw=(Get-ItemProperty -LiteralPath $p -ErrorAction Stop).NameServer;
-            @{service=[string]$_.ifIndex; automatic=[string]::IsNullOrWhiteSpace($raw); servers=@($raw -split '[,;\s]+' | Where-Object {$_})}
+            @{service=$guid.ToString('D'); automatic=[string]::IsNullOrWhiteSpace($raw); servers=@($raw -split '[,;\s]+' | Where-Object {$_})}
         }); ConvertTo-Json -InputObject $a -Depth 4 -Compress"#;
         let text = powershell(script).await?;
         let result: Vec<Backup> = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .map_err(|_| "Windows DNS 原始配置解析失败")?;
         for b in &result {
-            if b.service.parse::<u32>().is_err() {
-                return Err("网卡编号无效".into());
+            if uuid::Uuid::parse_str(&b.service).is_err() {
+                return Err("网卡 GUID 无效".into());
             }
             addresses(&b.servers.join(" "))?;
         }
@@ -258,7 +259,7 @@ async fn set(backup: &Backup) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let index = backup.service.parse::<u32>().map_err(|_| "网卡编号无效")?;
+        let guid = uuid::Uuid::parse_str(&backup.service).map_err(|_| "网卡 GUID 无效")?;
         addresses(&backup.servers.join(" "))?;
         let parameter = if backup.automatic {
             "-ResetServerAddresses".into()
@@ -273,7 +274,7 @@ async fn set(backup: &Backup) -> Result<(), String> {
                     .join(",")
             )
         };
-        powershell(&format!("Get-DnsClientServerAddress -InterfaceIndex {index} -AddressFamily IPv4 -ErrorAction Stop | Set-DnsClientServerAddress {parameter} -ErrorAction Stop")).await?;
+        powershell(&format!("$adapter=Get-NetAdapter -Physical -ErrorAction Stop | Where-Object {{[guid]$_.InterfaceGuid -eq [guid]'{guid}'}} | Select-Object -First 1; if (-not $adapter) {{ throw 'Original adapter unavailable; recovery retained' }}; Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction Stop | Set-DnsClientServerAddress {parameter} -ErrorAction Stop")).await?;
     }
     #[cfg(target_os = "linux")]
     {
