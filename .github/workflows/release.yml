@@ -61,18 +61,22 @@ jobs:
       - name: Collect packages and SHA-256
         shell: python
         run: |
-          import hashlib, pathlib, shutil
+          import hashlib, json, pathlib, shutil
           root = pathlib.Path('src-tauri/target/${{ matrix.target }}/release/bundle')
           out = pathlib.Path('beta-packages')
           out.mkdir()
           packages = [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in {'.dmg', '.exe', '.deb', '.appimage'}]
           if not packages:
               raise SystemExit('No packages produced')
+          version = json.loads(pathlib.Path('package.json').read_text(encoding='utf-8'))['version']
           for p in packages:
-              name = '${{ matrix.target }}-' + p.name
+              suffix = '-setup.exe' if p.suffix.lower() == '.exe' else p.suffix
+              name = 'wujian-' + version + '-${{ matrix.target }}' + suffix
               target = out / name
+              if target.exists():
+                  raise SystemExit('Duplicate package name: ' + name)
               shutil.copy2(p, target)
-              (out / (name + '.sha256')).write_text(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name + '\n', encoding='utf-8')
+              (out / (name + '.sha256')).write_text(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name + '\n', encoding='utf-8', newline='\n')
       - uses: actions/upload-artifact@v4
         with:
           name: beta-${{ matrix.target }}
