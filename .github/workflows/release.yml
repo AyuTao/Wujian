@@ -96,10 +96,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          check_id=$(gh run list --workflow check.yml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId')
+          test -n "$check_id" && test "$check_id" != null
+          gh run watch "$check_id" --exit-status --interval 30
           version=$(node -p 'require("./package.json").version')
           tag="v$version"
           if gh release view "$tag" >/dev/null 2>&1; then
             test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+            gh release edit "$tag" --target "$GITHUB_SHA" --notes-file docs/测试版发布说明.md
             gh release upload "$tag" beta-packages/* --clobber
           else
             gh release create "$tag" beta-packages/* --target "$GITHUB_SHA" --draft --prerelease --title "Wujian $version" --notes-file docs/测试版发布说明.md

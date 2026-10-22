@@ -220,6 +220,19 @@ pub fn new_tool(raw: &str) -> Result<ToolInfo, String> {
     Ok(tool(&id, &name, Some(path), desktop))
 }
 
+fn evidence_fingerprint(signature: &str, checks: &[CheckResult]) -> u64 {
+    // Observation times and command timing are not network configuration.
+    let mut evidence: Vec<_> = checks
+        .iter()
+        .map(|c| (&c.id, &c.status, &c.value))
+        .collect();
+    evidence.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    signature.hash(&mut hasher);
+    evidence.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub async fn inspect() -> NetworkInfo {
     let env_proxy = [
         "https_proxy",
@@ -375,13 +388,12 @@ pub async fn inspect() -> NetworkInfo {
     signature.push_str(&mode.value);
     signature.push_str(&mode.status);
     checks.push(mode);
-    let mut hasher = DefaultHasher::new();
-    signature.hash(&mut hasher);
+    let fingerprint = evidence_fingerprint(&signature, &checks);
     NetworkInfo {
         dns_servers,
         proxy_summary,
         checks,
-        fingerprint: hasher.finish(),
+        fingerprint,
         app_proxy_present,
         proxy_readable,
     }
@@ -682,18 +694,50 @@ mod tests {
         assert!(validate_tool_path("claude").is_err());
         assert!(validate_tool_path("/tmp/a\nfoo").is_err());
     }
-    #[tokio::test]
-    async fn inspect_fingerprint_is_stable_across_rapid_calls() {
-        let n1 = inspect().await;
-        let n2 = inspect().await;
-        let n3 = inspect().await;
+    #[test]
+    fn fingerprint_ignores_observation_times_but_tracks_dns_route_and_read_failures() {
+        let mut checks = vec![
+            CheckResult::local(
+                "network-route",
+                "Route",
+                "match",
+                "tun0",
+                "first observation",
+            ),
+            CheckResult::local("dns-config", "DNS", "observed", "本机 DNS", ""),
+        ];
+        let first = evidence_fingerprint("dns:127.0.0.1;proxy:local", &checks);
+        for c in &mut checks {
+            c.observed_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+            c.detail = "new observation".into();
+        }
+        checks.reverse();
         assert_eq!(
-            n1.fingerprint, n2.fingerprint,
-            "Fingerprint changed between call 1 and 2"
+            first,
+            evidence_fingerprint("dns:127.0.0.1;proxy:local", &checks)
         );
-        assert_eq!(
-            n2.fingerprint, n3.fingerprint,
-            "Fingerprint changed between call 2 and 3"
+        assert_ne!(
+            first,
+            evidence_fingerprint("dns:192.0.2.53;proxy:local", &checks)
+        );
+        checks
+            .iter_mut()
+            .find(|c| c.id == "network-route")
+            .unwrap()
+            .value = "physical0".into();
+        assert_ne!(
+            first,
+            evidence_fingerprint("dns:127.0.0.1;proxy:local", &checks)
+        );
+        let known = evidence_fingerprint("dns:127.0.0.1;proxy:local", &checks);
+        checks
+            .iter_mut()
+            .find(|c| c.id == "network-route")
+            .unwrap()
+            .status = "unknown".into();
+        assert_ne!(
+            known,
+            evidence_fingerprint("dns:127.0.0.1;proxy:local", &checks)
         );
     }
 }
