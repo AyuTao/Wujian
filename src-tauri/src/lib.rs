@@ -977,13 +977,13 @@ pub fn run() {
                         continue;
                     };
                     let network = platform::inspect().await;
-                    let settings = if let Ok(mut rt) = state.lock() {
+                    let (settings, start_rev, start_epoch) = if let Ok(mut rt) = state.lock() {
                         update_network(&mut rt, &network);
                         for nc in &network.checks {
                             rt.checks.retain(|c| c.id != nc.id);
                             rt.checks.push(nc.clone());
                         }
-                        rt.data.settings.clone()
+                        (rt.data.settings.clone(), rt.settings_revision, rt.epoch)
                     } else {
                         continue;
                     };
@@ -1008,16 +1008,13 @@ pub fn run() {
                         && last_probe.elapsed().as_secs() >= interval
                     {
                         last_probe = std::time::Instant::now();
-                        let start_rev = state
-                            .lock()
-                            .map(|rt| rt.settings_revision)
-                            .unwrap_or(u64::MAX);
                         let mut checks = network.checks.clone();
                         checks.extend(probes::run(&settings, &network).await);
                         let latest = platform::inspect().await;
                         if let Ok(mut rt) = state.lock() {
                             let stale = latest.fingerprint != network.fingerprint
-                                || rt.settings_revision != start_rev;
+                                || rt.settings_revision != start_rev
+                                || rt.epoch != start_epoch;
                             update_network(&mut rt, &latest);
                             if stale {
                                 for c in &mut checks {

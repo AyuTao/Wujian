@@ -15,6 +15,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+#[cfg(target_os = "windows")]
+pub(crate) use windows::powershell as system_powershell;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

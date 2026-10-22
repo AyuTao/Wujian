@@ -486,6 +486,7 @@ pub fn get_system_timezone() -> Result<String, String> {
     Ok("Asia/Shanghai".to_string())
 }
 
+#[cfg(test)]
 pub fn validate_timezone_name(tz: &str) -> Result<(), String> {
     if tz.is_empty()
         || tz.len() > 64
@@ -496,110 +497,6 @@ pub fn validate_timezone_name(tz: &str) -> Result<(), String> {
         return Err("时区标识符格式无效".into());
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn iana_to_windows_timezone(iana: &str) -> &'static str {
-    match iana {
-        "America/Los_Angeles" => "Pacific Standard Time",
-        "America/Denver" => "Mountain Standard Time",
-        "America/Chicago" => "Central Standard Time",
-        "America/New_York" => "Eastern Standard Time",
-        "Asia/Shanghai" => "China Standard Time",
-        "Asia/Tokyo" => "Tokyo Standard Time",
-        "Asia/Singapore" => "Singapore Standard Time",
-        "Asia/Hong_Kong" => "China Standard Time",
-        "Europe/London" => "GMT Standard Time",
-        "Europe/Berlin" => "W. Europe Standard Time",
-        "UTC" => "UTC",
-        other => {
-            // 如果已经是 Windows 时区名称或者未知，直接返回
-            if other.contains("Standard Time") {
-                "Pacific Standard Time"
-            } else {
-                "Pacific Standard Time"
-            }
-        }
-    }
-}
-
-pub async fn set_system_timezone(target_tz: &str) -> Result<(), String> {
-    validate_timezone_name(target_tz)?;
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut cmd = tokio::process::Command::new("/usr/sbin/systemsetup");
-        cmd.args(["-settimezone", target_tz]).kill_on_drop(true);
-        if let Ok(out) = cmd.output().await {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if out.status.success()
-                && !stderr.contains("requires an administrator password")
-                && !stderr.contains("You need administrator access")
-            {
-                if let Ok(verified) = get_system_timezone() {
-                    if verified == target_tz {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        let script = format!(
-            "do shell script \"/usr/sbin/systemsetup -settimezone {}\" with administrator privileges",
-            target_tz
-        );
-        let mut oscmd = tokio::process::Command::new("/usr/bin/osascript");
-        oscmd.args(["-e", &script]).kill_on_drop(true);
-        let out = oscmd
-            .output()
-            .await
-            .map_err(|e| format!("执行时区设置失败: {e}"))?;
-        if out.status.success() {
-            if let Ok(verified) = get_system_timezone() {
-                if verified == target_tz {
-                    return Ok(());
-                }
-            }
-        }
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("修改系统时区未授权或失败: {}", err.trim()));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut cmd = tokio::process::Command::new("pkexec");
-        cmd.args(["timedatectl", "set-timezone", target_tz])
-            .kill_on_drop(true);
-        let out = cmd
-            .output()
-            .await
-            .map_err(|e| format!("执行时区设置失败: {e}"))?;
-        if out.status.success() {
-            return Ok(());
-        }
-        return Err("修改 Linux 系统时区失败，请核对权限".into());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let win_tz = if target_tz.contains('/') {
-            iana_to_windows_timezone(target_tz)
-        } else {
-            target_tz
-        };
-        let mut cmd = tokio::process::Command::new("tzutil");
-        cmd.args(["/s", win_tz]).kill_on_drop(true);
-        let out = cmd
-            .output()
-            .await
-            .map_err(|e| format!("执行时区设置失败: {e}"))?;
-        if out.status.success() {
-            return Ok(());
-        }
-        return Err("修改 Windows 系统时区失败，请核对权限".into());
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    Err("当前平台不支持自动设置时区".into())
 }
 
 #[allow(dead_code)]
@@ -706,8 +603,13 @@ pub async fn restore_native_network(app_data_dir: &std::path::Path) -> Result<()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = app_data_dir;
-        Ok(())
+        match crate::recovery::load_recovery_record(app_data_dir) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(vec![
+                "发现旧版本恢复记录，此平台不支持其格式；请保留记录并手动恢复，未报告成功".into(),
+            ]),
+            Err(e) => Err(vec![e]),
+        }
     }
 }
 

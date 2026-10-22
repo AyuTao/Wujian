@@ -123,7 +123,13 @@ async fn cmd(program: &str, args: &[&str]) -> Result<String, String> {
 }
 #[cfg(target_os = "windows")]
 async fn powershell(script: &str) -> Result<String, String> {
-    cmd("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", &format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); {script}")]).await
+    let script = format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); {script}");
+    crate::firewall::command::run(
+        &crate::firewall::system_powershell()?,
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+        None,
+    )
+    .await
 }
 
 #[cfg(target_os = "macos")]
@@ -223,7 +229,7 @@ async fn capture() -> Result<Vec<Backup>, String> {
                 continue;
             }
             let service = entry.file_name().to_string_lossy().into_owned();
-            let text = cmd("resolvectl", &["dns", &service])
+            let text = cmd("/usr/bin/resolvectl", &["dns", &service])
                 .await
                 .map_err(|e| format!("仅支持 systemd-resolved 管理的 DNS，未修改：{e}"))?;
             let tail = text.split_once(':').ok_or("无法读取原 DNS")?.1.trim();
@@ -277,7 +283,7 @@ async fn set(backup: &Backup) -> Result<(), String> {
         } else {
             args.extend(backup.servers.iter().map(String::as_str));
         }
-        cmd("resolvectl", &args).await?;
+        cmd("/usr/bin/resolvectl", &args).await?;
     }
     // A successful exit alone is insufficient. Compare the effective/static snapshot.
     let current = capture().await?;
