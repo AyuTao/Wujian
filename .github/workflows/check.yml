@@ -85,15 +85,27 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $fixture = Join-Path $env:RUNNER_TEMP 'wujian-firewall-fixture'
-          $tokens = $null
-          $parseErrors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $fixture 'windows.ps1'), [ref]$tokens, [ref]$parseErrors)
-          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
-          $addresses = @(Get-Content (Join-Path $fixture 'denied-networks.json') -Raw | ConvertFrom-Json)
-          for ($i = 0; $i -lt $addresses.Count; $i += 128) {
-            $end = [Math]::Min($i + 127, $addresses.Count - 1)
-            New-NetFirewallRule -Name 'Wujian-CI-Validate' -DisplayName 'Wujian-CI-Validate' -Direction Outbound -Action Block -RemoteAddress $addresses[$i..$end] -WhatIf | Out-Null
+          $root = Join-Path $env:RUNNER_TEMP 'wujian-firewall-fixture'
+          foreach ($fixture in @($root, (Join-Path $root 'isolation'), (Join-Path $root 'ipv6'))) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $fixture 'windows.ps1'), [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+            [string[]]$addresses = ConvertFrom-Json -InputObject (Get-Content (Join-Path $fixture 'denied-networks.json') -Raw)
+            Write-Output ("Validating {0} addresses from {1}" -f $addresses.Count, $fixture)
+            for ($i = 0; $i -lt $addresses.Count; $i += 128) {
+              $end = [Math]::Min($i + 127, $addresses.Count - 1)
+              try {
+                New-NetFirewallRule -Name 'Wujian-CI-Validate' -DisplayName 'Wujian-CI-Validate' -Direction Outbound -Action Block -RemoteAddress $addresses[$i..$end] -WhatIf | Out-Null
+              } catch {
+                foreach ($address in $addresses[$i..$end]) {
+                  try {
+                    New-NetFirewallRule -Name 'Wujian-CI-Validate' -DisplayName 'Wujian-CI-Validate' -Direction Outbound -Action Block -RemoteAddress $address -WhatIf | Out-Null
+                  } catch { Write-Output ("Rejected address: " + $address) }
+                }
+                throw
+              }
+            }
           }
 
       - name: Test macOS packet decisions

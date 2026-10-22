@@ -8,23 +8,12 @@
   padding: 0;
   overflow: hidden;
   position: relative;
-  background: radial-gradient(
-    circle at 50% 15%,
-    #0b1528 0%,
-    #030710 70%,
-    #010307 100%
-  );
+  background: radial-gradient(circle at 50% 15%, #0b1528 0%, #030710 70%, #010307 100%);
   color: #e2e8f0;
   display: flex;
   flex-direction: column;
   user-select: none;
-  font-family:
-    ui-monospace,
-    "SF Mono",
-    "JetBrains Mono",
-    Menlo,
-    -apple-system,
-    sans-serif;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, -apple-system, sans-serif;
   box-sizing: border-box;
 }
 
@@ -272,9 +261,7 @@
   padding: 1px 5px;
   text-transform: uppercase;
   transform: rotate(-8deg);
-  box-shadow:
-    0 0 8px rgba(239, 68, 68, 0.35),
-    inset 0 0 5px rgba(239, 68, 68, 0.2);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.35), inset 0 0 5px rgba(239, 68, 68, 0.2);
   text-shadow: 0 0 4px rgba(239, 68, 68, 0.6);
   user-select: none;
   background: rgba(239, 68, 68, 0.08);
@@ -459,143 +446,4 @@
   z-index: 9999;
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.6);
   white-space: nowrap;
-}
-
-/* 检测详情和恢复错误需要在小窗口中保持可访问。 */
-.container {
-  overflow-y: auto;
-  justify-content: flex-start;
-  gap: 14px;
-}
-.brandSub {
-  font-size: 11px;
-}
-.statusPanel,
-.settingsPanel {
-  padding: 10px;
-  border: 1px solid #29415b;
-  border-radius: 4px;
-  font-size: 12px;
-  line-height: 1.6;
-}
-.statusPanel p,
-.settingsPanel p,
-.checkDetail p {
-  margin: 7px 0;
-  overflow-wrap: anywhere;
-}
-.statusPanel strong {
-  color: #7dd3fc;
-}
-.errorPanel {
-  color: #fca5a5;
-  padding: 10px;
-  border: 1px solid #7f1d1d;
-  font-size: 12px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  user-select: text;
-}
-.notice {
-  font-size: 12px;
-  color: #7dd3fc;
-  overflow-wrap: anywhere;
-  user-select: text;
-}
-.settingsPanel summary {
-  cursor: pointer;
-  font-weight: 700;
-}
-.settingsPanel form {
-  display: grid;
-  gap: 10px;
-  margin-top: 12px;
-}
-.settingsPanel label {
-  display: block;
-}
-.settingsPanel input:not([type="checkbox"]) {
-  display: block;
-  width: 100%;
-  margin-top: 5px;
-  padding: 7px;
-  box-sizing: border-box;
-  background: #0b1528;
-  border: 1px solid #3e526e;
-  color: #e2e8f0;
-  border-radius: 3px;
-}
-.settingsPanel input[type="checkbox"] {
-  margin-right: 8px;
-}
-.checkDetail {
-  font-size: 12px;
-  line-height: 1.6;
-}
-.checkDetail p {
-  padding: 0 10px;
-  color: #a8b7cd;
-}
-.checkDetail summary {
-  cursor: pointer;
-  list-style: none;
-}
-.rowColTitle {
-  width: 80px;
-  font-size: 11px;
-}
-.rowColData {
-  font-size: 11px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  display: block;
-}
-.logPreview {
-  max-height: 180px;
-  overflow: auto;
-  font-size: 10px;
-  user-select: text;
-}
-.modalBackdrop {
-  position: fixed;
-  inset: 0;
-  background: #000c;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-  padding: 16px;
-}
-.modal {
-  background: #0b1528;
-  border: 1px solid #3e526e;
-  padding: 22px;
-  border-radius: 6px;
-  max-width: 480px;
-  max-height: 85vh;
-  overflow: auto;
-  font-size: 13px;
-  line-height: 1.7;
-}
-.modal h3 {
-  margin-top: 0;
-  color: #7dd3fc;
-}
-.modal p {
-  white-space: pre-line;
-}
-.bottomAux {
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.screen button:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-.screen button:focus-visible,
-.screen summary:focus-visible,
-.screen input:focus-visible {
-  outline: 2px solid #38bdf8;
-  outline-offset: 3px;
 }

@@ -1,0 +1,104 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.panel {
+  width: 100%;
+  max-width: 480px;
+  max-height: 90dvh;
+  overflow-y: auto;
+  background: #0a0f1d;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 8px;
+  padding: 18px;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.65;
+  user-select: text;
+  box-sizing: border-box;
+}
+.panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.panel h3 {
+  margin: 0;
+  color: #38bdf8;
+  font-size: 16px;
+}
+.panel h4 {
+  margin: 0 0 10px;
+  color: #38bdf8;
+  font-size: 13px;
+}
+.panel section {
+  border-top: 1px solid #233349;
+  margin-top: 16px;
+  padding-top: 14px;
+}
+.panel p {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.panel form {
+  display: grid;
+  gap: 10px;
+}
+.panel label {
+  display: block;
+}
+.panel input:not([type="checkbox"]) {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 5px;
+  padding: 7px;
+  color: #e2e8f0;
+  background: #0b1528;
+  border: 1px solid #3e526e;
+  border-radius: 3px;
+}
+.panel input[type="checkbox"] {
+  margin-right: 8px;
+}
+.panel button {
+  border: 1px solid #334b67;
+  border-radius: 3px;
+  color: #cbd5e1;
+  background: #142238;
+  font: inherit;
+  cursor: pointer;
+  padding: 6px 10px;
+}
+.panel button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.panel pre {
+  max-height: 160px;
+  overflow: auto;
+  font-size: 10px;
+}
+.panel :focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.error {
+  color: #fca5a5;
+}
+.message {
+  color: #7dd3fc;
+}

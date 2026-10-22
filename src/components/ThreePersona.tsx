@@ -28,7 +28,7 @@ interface ThreePersonaProps {
 function drawPosterToCanvas(
   canvas: HTMLCanvasElement,
   hudData: PersonaHUDData,
-  activeRole: RoleType,
+  activeRole: RoleType
 ) {
   const ctx = canvas.getContext("2d")!;
   const w = canvas.width;
@@ -49,7 +49,7 @@ function drawPosterToCanvas(
   ctx.fillStyle = "rgba(15, 23, 42, 0.4)";
   for (let i = 0; i < 9; i++) {
     const bw = 80 + (i % 3) * 35;
-    const bh = 320 + ((i * 47) % 220);
+    const bh = 320 + (i * 47) % 220;
     const bx = 40 + i * 110;
     const by = 800 - bh;
     ctx.fillRect(bx, by, bw, bh + 400);
@@ -103,10 +103,7 @@ function drawPosterToCanvas(
 
   // 侧光轮廓
   ctx.lineWidth = 4;
-  ctx.strokeStyle =
-    activeRole === "jianming"
-      ? "rgba(56, 189, 248, 0.95)"
-      : "rgba(56, 189, 248, 0.65)";
+  ctx.strokeStyle = activeRole === "jianming" ? "rgba(56, 189, 248, 0.95)" : "rgba(56, 189, 248, 0.65)";
   ctx.shadowColor = "#38bdf8";
   ctx.shadowBlur = activeRole === "jianming" ? 22 : 12;
   ctx.beginPath();
@@ -154,10 +151,8 @@ function drawPosterToCanvas(
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.arc(280, 300, 65, 0, Math.PI * 2);
-  ctx.moveTo(195, 300);
-  ctx.lineTo(365, 300);
-  ctx.moveTo(280, 215);
-  ctx.lineTo(280, 385);
+  ctx.moveTo(195, 300); ctx.lineTo(365, 300);
+  ctx.moveTo(280, 215); ctx.lineTo(280, 385);
   ctx.stroke();
 
   // 左侧海报内嵌 HUD 数据 (直接融入海报，代替独立卡片)
@@ -169,13 +164,7 @@ function drawPosterToCanvas(
   ctx.fillText("刘建明 · 本机审查暗桩", 50, 780);
 
   // 4 项检测数据指标 (直接刻在海报上)
-  const drawLeftMetric = (
-    y: number,
-    num: string,
-    label: string,
-    val: string,
-    isOk: boolean,
-  ) => {
+  const drawLeftMetric = (y: number, num: string, label: string, val: string, isOk: boolean) => {
     ctx.font = "bold 12px ui-monospace, monospace";
     ctx.fillStyle = "rgba(56, 189, 248, 0.6)";
     ctx.fillText(num, 50, y);
@@ -200,28 +189,28 @@ function drawPosterToCanvas(
     "[01]",
     "物理网卡直连出站",
     hudData.isArmed ? "0% (已物理闭锁)" : "EXPOSED (直连泄露)",
-    hudData.isArmed,
+    hudData.isArmed
   );
   drawLeftMetric(
     865,
     "[02]",
     "53端口明文 DNS",
     hudData.isArmed ? "FAIL-CLOSED (静默)" : hudData.localDns || "192.168.1.1",
-    hudData.isArmed,
+    hudData.isArmed
   );
   drawLeftMetric(
     870 + 40,
     "[03]",
     "WebRTC STUN 穿透",
     hudData.webrtcStatus === "match" ? "BLOCKED (安全拦截)" : "LEAKED (有泄露)",
-    hudData.webrtcStatus === "match",
+    hudData.webrtcStatus === "match"
   );
   drawLeftMetric(
     870 + 80,
     "[04]",
     "驻机暗桩审查判定",
     hudData.isArmed ? "CLEARED (抓不到马脚)" : "FAIL (真实底细已暴露)",
-    hudData.isArmed,
+    hudData.isArmed
   );
   ctx.restore();
 
@@ -256,10 +245,7 @@ function drawPosterToCanvas(
 
   // 暖光轮廓
   ctx.lineWidth = 4;
-  ctx.strokeStyle =
-    activeRole === "yongren"
-      ? "rgba(245, 158, 11, 0.95)"
-      : "rgba(245, 158, 11, 0.65)";
+  ctx.strokeStyle = activeRole === "yongren" ? "rgba(245, 158, 11, 0.95)" : "rgba(245, 158, 11, 0.65)";
   ctx.shadowColor = "#f59e0b";
   ctx.shadowBlur = activeRole === "yongren" ? 22 : 12;
   ctx.beginPath();
@@ -314,10 +300,8 @@ function drawPosterToCanvas(
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.arc(744, 300, 65, 0, Math.PI * 2);
-  ctx.moveTo(659, 300);
-  ctx.lineTo(829, 300);
-  ctx.moveTo(744, 215);
-  ctx.lineTo(744, 385);
+  ctx.moveTo(659, 300); ctx.lineTo(829, 300);
+  ctx.moveTo(744, 215); ctx.lineTo(744, 385);
   ctx.stroke();
 
   // 右侧海报内嵌 HUD 数据 (直接融入海报，代替独立卡片)
@@ -328,13 +312,7 @@ function drawPosterToCanvas(
   ctx.fillStyle = "rgba(226, 232, 240, 0.85)";
   ctx.fillText("陈永仁 · 潜入总部卧底", 560, 780);
 
-  const drawRightMetric = (
-    y: number,
-    num: string,
-    label: string,
-    val: string,
-    isOk: boolean,
-  ) => {
+  const drawRightMetric = (y: number, num: string, label: string, val: string, isOk: boolean) => {
     ctx.font = "bold 12px ui-monospace, monospace";
     ctx.fillStyle = "rgba(245, 158, 11, 0.6)";
     ctx.fillText(num, 560, y);
@@ -361,21 +339,21 @@ function drawPosterToCanvas(
     "[01]",
     "远端代理出口 IP",
     egressDisplay,
-    Boolean(hudData.egressIp && hudData.egressIp !== "等待排查"),
+    Boolean(hudData.egressIp && hudData.egressIp !== "等待排查")
   );
   drawRightMetric(
     865,
     "[02]",
     "系统假面时区",
     `${hudData.currentTimezone} ${hudData.isTimezoneSynced ? "[MATCHED]" : "[DESYNC]"}`,
-    hudData.isTimezoneSynced,
+    hudData.isTimezoneSynced
   );
   drawRightMetric(
     870 + 40,
     "[03]",
     "Fail-Closed 断路保护",
     hudData.isArmed ? "ARMED (闭锁守护)" : "DISARMED (未武装)",
-    hudData.isArmed,
+    hudData.isArmed
   );
   drawRightMetric(
     870 + 80,
@@ -384,7 +362,7 @@ function drawPosterToCanvas(
     hudData.isArmed && hudData.isTimezoneSynced
       ? "INFILTRATED (完美潜伏)"
       : "RISK (存在破绽需武装)",
-    hudData.isArmed && hudData.isTimezoneSynced,
+    hudData.isArmed && hudData.isTimezoneSynced
   );
   ctx.restore();
 
@@ -418,11 +396,7 @@ function drawPosterToCanvas(
   ctx.putImageData(imgData, 0, 0);
 }
 
-export function ThreePersona({
-  activeRole,
-  onSelectRole,
-  hudData,
-}: ThreePersonaProps) {
+export function ThreePersona({ activeRole, onSelectRole, hudData }: ThreePersonaProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const textureRef = useRef<THREE.CanvasTexture | null>(null);
@@ -526,10 +500,7 @@ export function ThreePersona({
       posArray[i * 3 + 1] = (Math.random() - 0.5) * 4.0;
       posArray[i * 3 + 2] = (Math.random() - 0.5) * 1.6;
     }
-    particleGeo.setAttribute(
-      "position",
-      new THREE.BufferAttribute(posArray, 3),
-    );
+    particleGeo.setAttribute("position", new THREE.BufferAttribute(posArray, 3));
     const particleMat = new THREE.PointsMaterial({
       size: 0.022,
       color: 0xcfdbe8,
@@ -620,12 +591,8 @@ export function ThreePersona({
       const isJianming = activeRoleRef.current === "jianming";
       const isYongren = activeRoleRef.current === "yongren";
 
-      jianmingHoloMat.opacity = isJianming
-        ? 0.16 + Math.sin(time * 3.5) * 0.04
-        : 0.03;
-      yongrenHoloMat.opacity = isYongren
-        ? 0.16 + Math.sin(time * 3.5) * 0.04
-        : 0.03;
+      jianmingHoloMat.opacity = isJianming ? 0.16 + Math.sin(time * 3.5) * 0.04 : 0.03;
+      yongrenHoloMat.opacity = isYongren ? 0.16 + Math.sin(time * 3.5) * 0.04 : 0.03;
 
       const positions = particleGeo.attributes.position.array as Float32Array;
       for (let i = 0; i < particleCount; i++) {
