@@ -13,6 +13,7 @@ mod protection;
 mod proxy_core;
 pub mod recovery;
 mod safety;
+mod shortcuts;
 mod store;
 mod timezone_follow;
 
@@ -195,6 +196,54 @@ fn discover_tools(state: State<'_, AppState>) -> Result<Vec<ToolInfo>, String> {
         Ok(runtime.tools.clone())
     })
 }
+
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    audit::record("autostart.read", || {
+        app.autolaunch().is_enabled().map_err(|e| e.to_string())
+    })
+}
+#[tauri::command]
+fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    audit::record("autostart.configure", || {
+        let manager = app.autolaunch();
+        if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        }
+        .map_err(|e| e.to_string())?;
+        let actual = manager.is_enabled().map_err(|e| e.to_string())?;
+        if actual != enabled {
+            return Err("开机启动状态未通过回读，请检查系统登录项设置".into());
+        }
+        Ok(actual)
+    })
+}
+#[tauri::command]
+fn set_auto_arm(enabled: bool, state: State<'_, AppState>) -> Result<bool, String> {
+    audit::record("autostart.arm", || {
+        let mut runtime = state.lock()?;
+        if runtime.data.settings.auto_arm == enabled {
+            return Ok(enabled);
+        }
+        let mut data = runtime.data.clone();
+        data.settings.auto_arm = enabled;
+        store::save(&state.dir, &mut data)?;
+        runtime.data = data;
+        Ok(enabled)
+    })
+}
+#[tauri::command]
+async fn scan_shortcuts() -> Result<Vec<shortcuts::Shortcut>, String> {
+    audit::record_async("shortcuts.scan", shortcuts::scan()).await
+}
+#[tauri::command]
+async fn launch_shortcut(id: String) -> Result<(), String> {
+    audit::record_async("shortcuts.launch", shortcuts::launch(&id)).await
+}
 #[tauri::command]
 fn save_settings(mut settings: Settings, state: State<'_, AppState>) -> Result<Settings, String> {
     audit::record("settings.save", || {
@@ -207,8 +256,10 @@ fn save_settings(mut settings: Settings, state: State<'_, AppState>) -> Result<S
             .geoip_database_path
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        settings.timezone_mode = "egress".into();
         probes::validate_settings(&settings)?;
         let mut runtime = state.lock()?;
+        settings.auto_arm = runtime.data.settings.auto_arm;
         if settings.original_timezone.is_none() && runtime.data.settings.original_timezone.is_some()
         {
             settings.original_timezone = runtime.data.settings.original_timezone.clone();
@@ -302,9 +353,7 @@ fn current_decision(rt: &Runtime) -> CircuitBreakerReport {
 }
 fn native_timezone_evidence(checks: &mut Vec<CheckResult>, rt: &Runtime) {
     checks.retain(|c| c.id != "timezone-follow");
-    if rt.data.settings.timezone_mode == "egress" {
-        checks.push(rt.timezone_follow.check(checks));
-    }
+    checks.push(rt.timezone_follow.check(checks));
 }
 fn sync_tunnel_status(rt: &mut Runtime) {
     let Some(policy) = rt.protection.tunnel_policy.as_ref() else {
@@ -357,6 +406,13 @@ async fn native_request(
     state: &AppState,
     request: firewall::Request,
 ) -> Result<firewall::Receipt, String> {
+    native_request_prompt(state, request, true).await
+}
+async fn native_request_prompt(
+    state: &AppState,
+    request: firewall::Request,
+    allow_prompt: bool,
+) -> Result<firewall::Receipt, String> {
     let event = match request.action.as_str() {
         "apply" => match request.policy.as_ref() {
             Some(p) if p.tunnel_guard.is_some() => "native.tunnel.apply",
@@ -366,14 +422,15 @@ async fn native_request(
         "release" => "native.firewall.release",
         "status" => "native.firewall.verify",
         "guard-plan" => "native.guard.prepare",
-        "network-apply" => "native.dns.apply",
+        "guard-switch" => "native.guard.switch",
+        "network-apply" | "network-apply-keep" => "native.dns.apply",
         "network-release" => "native.dns.restore",
         _ => "native.diagnostics",
     };
     let mut span = audit::Span::new(event);
     let mut request = request;
     request.operation_id = Some(span.id());
-    let result = firewall::elevated(request, &state.dir).await;
+    let result = firewall::elevated_prompt(request, &state.dir, allow_prompt).await;
     span.finish(&result);
     result
 }
@@ -394,7 +451,7 @@ async fn enforce_current(state: &AppState, retry: bool) -> Result<(), String> {
         }
         rt.protection.save(&state.dir)?;
     }
-    let result = native_request(
+    let result = native_request_prompt(
         state,
         firewall::Request {
             operation_id: None,
@@ -404,6 +461,7 @@ async fn enforce_current(state: &AppState, retry: bool) -> Result<(), String> {
             policy: Some(firewall::policy::Policy::isolation()),
             acknowledge_connection_reset: true,
         },
+        false,
     )
     .await;
     let mut rt = state.lock()?;
@@ -424,16 +482,18 @@ async fn enforce_current(state: &AppState, retry: bool) -> Result<(), String> {
 }
 async fn configure_ipv6_filter(state: &AppState) -> Result<(), String> {
     audit::record_async("ipv6.configure", async {
+        let _lifecycle = state.lifecycle_lock.lock().await;
         let _op = state.op_lock.lock().await;
         {
             let mut rt = state.lock()?;
             if rt.protection.isolation_pending {
                 return Err("隔离期间不能用 IPv6 规则覆盖整机隔离；请先明确停止防护。".into());
             }
-            if rt.protection.tunnel_policy.is_some() {
+            if rt.protection.armed || rt.protection.tunnel_policy.is_some() {
                 return Err("全局保护已包含隧道外 IPv6 阻断，不能用单独规则覆盖。".into());
             }
             rt.protection.filter_may_exist = true;
+            rt.protection.ipv6_only = true;
             rt.protection.ipv6_filtering = false;
             rt.protection.save(&state.dir)?;
         }
@@ -468,6 +528,58 @@ async fn configure_ipv6_filter(state: &AppState) -> Result<(), String> {
             Err(e.clone())
         } else {
             Ok(())
+        }
+    })
+    .await
+}
+
+async fn release_ipv6_filter(state: &AppState) -> Result<(), String> {
+    audit::record_async("ipv6.restore", async {
+        let _lifecycle = state.lifecycle_lock.lock().await;
+        let _op = state.op_lock.lock().await;
+        {
+            let rt = state.lock()?;
+            if rt.protection.armed
+                || rt.protection.isolation_pending
+                || rt.protection.tunnel_policy.is_some()
+            {
+                return Err("整机保护中不能单独解除 IPv6 规则，请先停止保护".into());
+            }
+            if !rt.protection.ipv6_only {
+                return Err("没有独立 IPv6 配置；如有遗留配置，请使用恢复本工具配置".into());
+            }
+        }
+        let result = native_request(
+            state,
+            firewall::Request {
+                operation_id: None,
+                guard_user: None,
+                dns: None,
+                action: "release".into(),
+                policy: None,
+                acknowledge_connection_reset: false,
+            },
+        )
+        .await
+        .and_then(|receipt| {
+            if receipt.configuration_active {
+                Err("IPv6 规则仍存在，恢复未确认".into())
+            } else {
+                Ok(receipt)
+            }
+        });
+        let mut rt = state.lock()?;
+        match result {
+            Ok(receipt) => {
+                rt.protection.complete_ipv6_release(receipt)?;
+                // DNS backups, timezone and full protection are independent.
+                rt.protection.save(&state.dir)
+            }
+            Err(error) => {
+                rt.protection.error = Some(error.clone());
+                rt.protection.save(&state.dir)?;
+                Err(error)
+            }
         }
     })
     .await
@@ -583,6 +695,201 @@ async fn run_checks_inner(
     Ok(report)
 }
 
+async fn mainland_zone_after_follow(state: &AppState, allow_prompt: bool) -> Option<String> {
+    let _ = follow_timezone(state, true, allow_prompt).await;
+    platform::get_system_timezone()
+        .ok()
+        .filter(|zone| platform::mainland_timezone(zone))
+}
+
+async fn isolate_for_mainland(state: &AppState, zone: &str, allow_prompt: bool) -> String {
+    let message =
+        format!("时区仍是中国大陆（{zone}），已切断公网。停止保护后，时区会继续跟随出口。");
+    let _op = state.op_lock.lock().await;
+    {
+        let mut rt = match state.lock() {
+            Ok(rt) => rt,
+            Err(error) => return format!("{message} {error}"),
+        };
+        if rt.protection.armed || rt.protection.isolation_pending {
+            return "保护已开启；请核验或明确停止，不能直接替换出口计划。".into();
+        }
+        rt.protection.armed = true;
+        rt.protection.isolation_pending = true;
+        rt.protection.filter_may_exist = true;
+        rt.protection.tunnel_policy = None;
+        rt.protection.tunnel_guard_confirmed = false;
+        rt.protection.ipv6_only = false;
+        rt.protection.baseline = None;
+        rt.protection.incident_reason = Some(message.clone());
+        rt.protection.error = Some(message.clone());
+        if let Err(error) = rt.protection.save(&state.dir) {
+            return format!("{message} {error}");
+        }
+        FIREWALL_ACTIVE.store(true, Ordering::SeqCst);
+    }
+    let result = native_request_prompt(
+        state,
+        firewall::Request {
+            operation_id: None,
+            guard_user: None,
+            dns: None,
+            action: "apply".into(),
+            policy: Some(firewall::policy::Policy::isolation()),
+            acknowledge_connection_reset: true,
+        },
+        allow_prompt,
+    )
+    .await;
+    let mut rt = match state.lock() {
+        Ok(rt) => rt,
+        Err(error) => return format!("{message} {error}"),
+    };
+    match result {
+        Ok(receipt) => {
+            let confirmed = receipt.configuration_active && receipt.policy_mode == "isolation";
+            rt.protection.receipt = Some(receipt);
+            if !confirmed {
+                let error = format!("{message} 断网规则未确认。");
+                rt.protection.error = Some(error.clone());
+                let _ = rt.protection.save(&state.dir);
+                return error;
+            }
+            rt.protection.error = Some(message.clone());
+            let _ = rt.protection.save(&state.dir);
+            message
+        }
+        Err(error) => {
+            let error = format!("{message} {error}");
+            rt.protection.error = Some(error.clone());
+            let _ = rt.protection.save(&state.dir);
+            error
+        }
+    }
+}
+
+async fn desktop_uid() -> Result<u32, String> {
+    if cfg!(target_os = "windows") {
+        return Ok(1);
+    }
+    platform::output("/usr/bin/id", &["-u"])
+        .await
+        .ok_or("无法读取桌面用户")?
+        .trim()
+        .parse()
+        .map_err(|_| "桌面用户无效".into())
+}
+
+#[tauri::command]
+async fn arm_automatically(state: State<'_, AppState>) -> Result<String, String> {
+    audit::record_async("guard.auto_arm", async {
+        let _lifecycle = state.lifecycle_lock.lock().await;
+        {
+            let rt = state.lock()?;
+            if !rt.data.settings.auto_arm || rt.protection.armed || rt.protection.isolation_pending
+            {
+                return Ok(String::new());
+            }
+        }
+        if let Some(zone) = mainland_zone_after_follow(state.inner(), false).await {
+            #[cfg(target_os = "macos")]
+            if !admin_helper::ready() {
+                return Err(format!(
+                    "时区仍是中国大陆（{zone}）。管理组件未就绪，未能断网。"
+                ));
+            }
+            return Err(isolate_for_mainland(state.inner(), &zone, false).await);
+        }
+        #[cfg(target_os = "macos")]
+        if !admin_helper::ready() {
+            return Err("管理组件未就绪，未自动开启保护".into());
+        }
+        let _op = state.op_lock.lock().await;
+        let uid = desktop_uid().await?;
+        let plan = native_request_prompt(
+            state.inner(),
+            firewall::Request {
+                operation_id: None,
+                guard_user: Some(uid),
+                dns: None,
+                action: "guard-switch".into(),
+                policy: None,
+                acknowledge_connection_reset: false,
+            },
+            false,
+        )
+        .await?;
+        let policy = plan.guard_policy.ok_or("未返回可核验的隧道计划")?;
+        policy.validate()?;
+        let switched = plan.switched_node.filter(|name| !name.is_empty());
+        {
+            let mut rt = state.lock()?;
+            if rt.protection.armed || rt.protection.isolation_pending {
+                return Ok(String::new());
+            }
+            rt.protection.filter_may_exist = true;
+            rt.protection.tunnel_policy = Some(policy.clone());
+            rt.protection.ipv6_only = false;
+            rt.protection.tunnel_guard_confirmed = false;
+            rt.protection.save(&state.dir)?;
+        }
+        let result = native_request_prompt(
+            state.inner(),
+            firewall::Request {
+                operation_id: None,
+                guard_user: None,
+                dns: None,
+                action: "apply".into(),
+                policy: Some(policy.clone()),
+                acknowledge_connection_reset: true,
+            },
+            false,
+        )
+        .await;
+        let mut rt = state.lock()?;
+        let switched_name = switched.clone();
+        let shown = move |error: String| match switched_name {
+            Some(name) => format!("已改用线路 {name}，保护没有打开：{error}"),
+            None => error,
+        };
+        match result {
+            Ok(receipt)
+                if receipt.configuration_active
+                    && receipt.policy_mode == "tunnel"
+                    && receipt.generation.as_deref() == Some(policy.generation.as_str()) =>
+            {
+                rt.protection.armed = true;
+                rt.protection.baseline = None;
+                rt.protection.tunnel_guard_confirmed = true;
+                rt.protection.ipv6_filtering = true;
+                rt.protection.error = None;
+                rt.protection.receipt = Some(receipt);
+                FIREWALL_ACTIVE.store(true, Ordering::SeqCst);
+                rt.protection.save(&state.dir)?;
+                Ok(match switched {
+                    Some(name) => format!("已改用线路 {name}，保护已开启"),
+                    None => "保护已开启".into(),
+                })
+            }
+            Ok(receipt) => {
+                rt.protection.receipt = Some(receipt);
+                let error =
+                    shown("未完整确认全局保护；规则可能已保留，请核验或明确停止保护。".into());
+                rt.protection.error = Some(error.clone());
+                rt.protection.save(&state.dir)?;
+                Err(error)
+            }
+            Err(error) => {
+                let error = shown(error);
+                rt.protection.error = Some(error.clone());
+                rt.protection.save(&state.dir)?;
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
 #[tauri::command]
 async fn prepare_firewall(
     database_path: Option<String>,
@@ -606,16 +913,7 @@ async fn prepare_firewall(
     if !matches!(mode.status.as_str(), "match" | "unknown") {
         return Err(mode.value);
     }
-    let uid: u32 = if cfg!(target_os = "windows") {
-        1
-    } else {
-        platform::output("/usr/bin/id", &["-u"])
-            .await
-            .ok_or("无法读取桌面用户")?
-            .trim()
-            .parse()
-            .map_err(|_| "桌面用户无效")?
-    };
+    let uid = desktop_uid().await?;
     let receipt = native_request(
         state.inner(),
         firewall::Request {
@@ -659,6 +957,11 @@ async fn prepare_firewall(
     }
     if !guard.dns_note.is_empty() {
         summary.push_str(&guard.dns_note);
+    }
+    if platform::get_system_timezone().is_ok_and(|zone| platform::mainland_timezone(&zone)) {
+        summary.push_str(
+            "当前时区仍是中国大陆。开启时会先跟随出口；若改完仍是中国大陆，将直接断网。",
+        );
     }
     let rules = if cfg!(target_os = "windows") {
         firewall::render::windows(&policy)?
@@ -746,6 +1049,9 @@ async fn firewall_action(
             if !acknowledge {
                 return Err("请先核对节点计划，确认重置连接并安装常驻保护 helper。".into());
             }
+            if let Some(zone) = mainland_zone_after_follow(state.inner(), true).await {
+                return Err(isolate_for_mainland(state.inner(), &zone, true).await);
+            }
             let _op = state.op_lock.lock().await;
             let policy = {
                 let mut rt = state.lock()?;
@@ -768,6 +1074,7 @@ async fn firewall_action(
                 }
                 rt.protection.filter_may_exist = true;
                 rt.protection.tunnel_policy = Some(policy.clone());
+                rt.protection.ipv6_only = false;
                 rt.protection.tunnel_guard_confirmed = false;
                 rt.protection.save(&state.dir)?;
                 policy
@@ -919,6 +1226,7 @@ async fn firewall_action(
             generation: None,
             checked_at: chrono::Utc::now().to_rfc3339(),
             detail: "还没有系统隔离回读。".into(),
+            switched_node: None,
         });
         if let Some(error) = &rt.protection.error {
             receipt.detail = error.clone();
@@ -1053,15 +1361,19 @@ async fn follow_egress_timezone(state: State<'_, AppState>) -> Result<TimezoneIn
     audit::record_async("timezone.follow_manual", async {
         let _lifecycle = state.lifecycle_lock.lock().await;
         let _probe = state.probe_lock.lock().await;
-        follow_timezone(state.inner(), true)
+        follow_timezone(state.inner(), true, true)
             .await?
             .ok_or("未开启时区跟随".into())
     })
     .await
 }
 
-async fn follow_timezone(state: &AppState, force: bool) -> Result<Option<TimezoneInfo>, String> {
-    let (settings, revision, cached) = {
+async fn follow_timezone(
+    state: &AppState,
+    force: bool,
+    allow_prompt: bool,
+) -> Result<Option<TimezoneInfo>, String> {
+    let (mut settings, revision, cached) = {
         let mut rt = state.lock()?;
         if rt.protection.isolation_pending
             || rt.protection.armed && rt.protection.tunnel_policy.is_none()
@@ -1072,10 +1384,6 @@ async fn follow_timezone(state: &AppState, force: bool) -> Result<Option<Timezon
             } else {
                 Ok(None)
             };
-        }
-        if !force && rt.data.settings.timezone_mode != "egress" {
-            audit::transition("timezone.follow_state", "disabled", None);
-            return Ok(None);
         }
         audit::transition("timezone.follow_state", "enabled", None);
         let ip = rt
@@ -1111,6 +1419,7 @@ async fn follow_timezone(state: &AppState, force: bool) -> Result<Option<Timezon
         rt.timezone_follow.begin(ip.as_deref().unwrap_or(""));
         (rt.data.settings.clone(), rt.settings_revision, cached)
     };
+    settings.external_ip_consent = true;
     audit::event(
         "timezone.follow",
         if cached.is_some() { "cached" } else { "lookup" },
@@ -1149,14 +1458,7 @@ async fn follow_timezone(state: &AppState, force: bool) -> Result<Option<Timezon
         // The first privileged change asks once and installs the resident admin helper.
         // Later timezone, protection, DNS, and IPv6 calls use it and do not prompt.
         let app_data = state.dir.clone();
-        if !force && !admin_helper::ready() && admin_helper::declined(&app_data) {
-            let mut rt = state.lock()?;
-            if rt.settings_revision == revision && rt.data.settings.timezone_mode == "egress" {
-                rt.timezone_follow.bind(target.ip, target.timezone);
-            }
-            return Ok(None);
-        }
-        if force {
+        if allow_prompt {
             admin_helper::clear_declined(&app_data);
         }
         let result = apply_timezone(
@@ -1164,12 +1466,12 @@ async fn follow_timezone(state: &AppState, force: bool) -> Result<Option<Timezon
             state,
             Some(revision),
             Some(target.ip.clone()),
-            force || !admin_helper::ready(),
+            allow_prompt,
         )
         .await;
         if let Err(error) = &result {
             let mut rt = state.lock()?;
-            if rt.data.settings.timezone_mode == "egress" {
+            if rt.settings_revision == revision {
                 rt.timezone_follow.error = Some(error.clone());
                 if !error.contains("未响应") {
                     rt.timezone_follow.application_blocked = true;
@@ -1430,6 +1732,53 @@ async fn configure_dns(servers: Vec<String>, state: State<'_, AppState>) -> Resu
     .await
 }
 #[tauri::command]
+async fn apply_overseas_dns(state: State<'_, AppState>) -> Result<(), String> {
+    audit::record_async("dns.overseas", async {
+        let change = network_dns::Change {
+            servers: network_dns::overseas_system_dns(),
+        };
+        change.validate()?;
+        let _op = state.op_lock.lock().await;
+        // Flag the write before the helper runs. A crash mid-change can still
+        // restore. Success clears it so stopping protection leaves 1.1.1.1.
+        let was_modified = {
+            let mut rt = state.lock()?;
+            let was = rt.protection.dns_modified;
+            rt.protection.dns_modified = true;
+            rt.protection.save(&state.dir)?;
+            was
+        };
+        let result = native_request(
+            state.inner(),
+            firewall::Request {
+                operation_id: None,
+                guard_user: None,
+                dns: Some(change),
+                action: "network-apply-keep".into(),
+                policy: None,
+                acknowledge_connection_reset: false,
+            },
+        )
+        .await;
+        let mut rt = state.lock()?;
+        match result {
+            Ok(_) => {
+                rt.protection.dns_modified = false;
+                rt.protection.save(&state.dir)?;
+                Ok(())
+            }
+            Err(e) => {
+                if !e.contains("原始记录已保留") {
+                    rt.protection.dns_modified = was_modified;
+                }
+                rt.protection.save(&state.dir)?;
+                Err(e)
+            }
+        }
+    })
+    .await
+}
+#[tauri::command]
 async fn toggle_gate(
     gate_id: String,
     enable: bool,
@@ -1462,7 +1811,7 @@ async fn toggle_gate(
                 if enable {
                     configure_ipv6_filter(state.inner()).await?;
                 } else {
-                    firewall_action("release".into(), None, true, state.clone()).await?;
+                    release_ipv6_filter(state.inner()).await?;
                 }
             }
             // DNS button now rechecks; never overwrite a client's resolver policy.
@@ -1472,6 +1821,24 @@ async fn toggle_gate(
         run_checks(0, Some("operation".into()), state).await
     })
     .await
+}
+#[tauri::command]
+fn diagnostic_log_directory(state: State<'_, AppState>) -> Result<String, String> {
+    let path = state.dir.join("logs");
+    std::fs::create_dir_all(&path).map_err(|_| "无法打开日志文件夹")?;
+    Ok(platform::existing_directory(&path.to_string_lossy())?
+        .to_string_lossy()
+        .into_owned())
+}
+#[tauri::command]
+async fn pick_save_directory() -> Result<Option<String>, String> {
+    Ok(platform::choose_directory()
+        .await?
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+#[tauri::command]
+fn open_directory(path: String) -> Result<(), String> {
+    platform::open_directory(std::path::Path::new(&path))
 }
 #[tauri::command]
 fn get_diagnostic_logs() -> Result<Vec<audit::Entry>, String> {
@@ -1492,8 +1859,12 @@ struct DiagnosticExport {
     app_healthy: bool,
 }
 #[tauri::command]
-async fn export_diagnostic_logs(state: State<'_, AppState>) -> Result<DiagnosticExport, String> {
+async fn export_diagnostic_logs(
+    destination: String,
+    state: State<'_, AppState>,
+) -> Result<DiagnosticExport, String> {
     audit::record_async("logs.export", async {
+        let folder = platform::existing_directory(&destination)?;
         let system = firewall::diagnostic_bundle(&state.dir).await;
         let system_status = match &system {
             Ok(bundle) if !bundle.initialized => "unavailable",
@@ -1507,9 +1878,10 @@ async fn export_diagnostic_logs(state: State<'_, AppState>) -> Result<Diagnostic
         if let Ok(system) = &system { entries.extend(system.entries.clone()); }
         entries.sort_by(|a, b| a.at.cmp(&b.at));
         let system_error = system.as_ref().err().map(|e| audit::error_kind(e));
-        let folder = state.dir.join("reports");
-        std::fs::create_dir_all(&folder).map_err(|_| "无法创建日志导出目录".to_string())?;
-        let path = folder.join(format!("wujian-diagnostics-{}.json", uuid::Uuid::new_v4().simple()));
+        let path = folder.join(format!(
+            "wujian-diagnostics-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
         let data = serde_json::json!({
             "formatVersion": 2, "version": env!("CARGO_PKG_VERSION"),
             "platform": std::env::consts::OS, "arch": std::env::consts::ARCH,
@@ -1520,7 +1892,11 @@ async fn export_diagnostic_logs(state: State<'_, AppState>) -> Result<Diagnostic
                 "health": system.as_ref().ok().map(|s| serde_json::json!({ "initialized": s.initialized, "droppedEvents": s.dropped_events, "unreadableFiles": s.unreadable_files, "invalidLines": s.invalid_lines })) },
             "entries": entries,
         });
-        firewall::write_private(&path, &serde_json::to_vec_pretty(&data).map_err(|_| "日志导出编码失败".to_string())?)?;
+        firewall::write_private(
+            &path,
+            &serde_json::to_vec_pretty(&data).map_err(|_| "日志导出编码失败".to_string())?,
+        )
+        .map_err(|_| "无法写入所选文件夹")?;
         Ok(DiagnosticExport { path: path.to_string_lossy().into_owned(), system_logs: system_status.into(), app_healthy })
     }).await
 }
@@ -1667,6 +2043,7 @@ mod macos_event_filter {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .menu(|app| {
             let safe_quit = MenuItemBuilder::with_id("safe_quit", "退出无间道").build(app)?;
             let safe_close = MenuItemBuilder::with_id("safe_close", "关闭窗口").build(app)?;
@@ -1683,10 +2060,15 @@ pub fn run() {
                 eprintln!("Diagnostic logging unavailable; export will include health status");
             }
             audit::install_panic_hook();
-            let (data, init_error) = match store::load(&dir) {
+            let (mut data, init_error) = match store::load(&dir) {
                 Ok(data) => (data, None),
                 Err(error) => (StoredData::default(), Some(error)),
             };
+            let mut settings_changed = store::apply_observation_defaults(&mut data);
+            settings_changed |= data.settings.promote_egress_timezone();
+            if settings_changed {
+                let _ = store::save(&dir, &mut data);
+            }
             audit::transition("settings.load", if init_error.is_some() { "error" } else { "ok" }, init_error.as_deref());
             let protection = protection::ProtectionStatus::load(&dir);
             audit::transition("protection.load", if protection.error.is_some() { "error" } else { "ok" }, protection.error.as_deref());
@@ -1726,7 +2108,7 @@ pub fn run() {
                     let state = handle.state::<AppState>();
                     let Ok(_lifecycle) = state.lifecycle_lock.try_lock() else { continue; };
                     let Ok(_probe) = state.probe_lock.try_lock() else { continue; };
-                    if let Err(error) = follow_timezone(state.inner(), false).await {
+                    if let Err(error) = follow_timezone(state.inner(), false, false).await {
                         audit::event("timezone.follow", "error", Some(&error), None);
                     }
                 }
@@ -1811,6 +2193,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_autostart,
+            set_autostart,
+            set_auto_arm,
+            arm_automatically,
+            scan_shortcuts,
+            launch_shortcut,
             discover_tools,
             save_settings,
             run_checks,
@@ -1825,8 +2213,12 @@ pub fn run() {
             restore_system_timezone,
             pin_egress_ip,
             configure_dns,
+            apply_overseas_dns,
             record_frontend_event,
             get_diagnostic_logs,
+            diagnostic_log_directory,
+            pick_save_directory,
+            open_directory,
             export_diagnostic_logs,
             open_url,
             optimize_all_gates,

@@ -22,6 +22,8 @@ pub struct ProtectionStatus {
     pub dns_modified: bool,
     pub filter_may_exist: bool,
     pub ipv6_filtering: bool,
+    /// Independent IPv6 intent survives restart; never implies whole-machine protection.
+    pub ipv6_only: bool,
     pub isolation_pending: bool,
     pub receipt: Option<Receipt>,
     pub error: Option<String>,
@@ -29,6 +31,20 @@ pub struct ProtectionStatus {
     pub incident_reason: Option<String>,
 }
 impl ProtectionStatus {
+    pub fn can_release_ipv6(&self) -> bool {
+        self.ipv6_only && !self.armed && !self.isolation_pending && self.tunnel_policy.is_none()
+    }
+    pub fn complete_ipv6_release(&mut self, receipt: Receipt) -> Result<(), String> {
+        if !self.can_release_ipv6() || receipt.configuration_active {
+            return Err("IPv6 恢复未确认，保留原配置记录".into());
+        }
+        self.ipv6_only = false;
+        self.ipv6_filtering = false;
+        self.filter_may_exist = false;
+        self.receipt = Some(receipt);
+        self.error = None;
+        Ok(())
+    }
     pub fn load(dir: &Path) -> Self {
         let path = dir.join("protection.json");
         match std::fs::read(&path) {
@@ -40,12 +56,20 @@ impl ProtectionStatus {
                     dns_modified: false,
                     filter_may_exist: true,
                     ipv6_filtering: false,
+                    ipv6_only: false,
                     isolation_pending: true,
                     error: Some("隔离记录损坏，请停止保护后重新开启".into()),
                     receipt: None,
                     baseline: None,
                     incident_reason: None,
                 });
+                value.ipv6_only |= !value.armed
+                    && !value.isolation_pending
+                    && (value.ipv6_filtering
+                        || value
+                            .receipt
+                            .as_ref()
+                            .is_some_and(|r| r.policy_mode == "ipv6"));
                 value.ipv6_filtering = false;
                 value.tunnel_guard_confirmed = false;
                 // A saved receipt is history, never current enforcement evidence.
@@ -68,6 +92,7 @@ impl ProtectionStatus {
                 dns_modified: false,
                 filter_may_exist: true,
                 ipv6_filtering: false,
+                ipv6_only: false,
                 isolation_pending: true,
                 receipt: None,
                 baseline: None,
@@ -121,6 +146,41 @@ impl ProtectionStatus {
 mod tests {
     use super::*;
     #[test]
+    fn independent_ipv6_release_preserves_dns_and_survives_restart() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut status = ProtectionStatus {
+            ipv6_filtering: true,
+            filter_may_exist: true,
+            dns_modified: true,
+            ..Default::default()
+        };
+        // Also migrate the previous version's IPv6-only record.
+        status.save(&dir).unwrap();
+        status = ProtectionStatus::load(&dir);
+        assert!(status.ipv6_only && !status.ipv6_filtering && !status.armed);
+        let receipt = Receipt {
+            configuration_active: false,
+            ..Receipt::new(false, None, "test")
+        };
+        status.armed = true;
+        assert!(status.complete_ipv6_release(receipt.clone()).is_err());
+        status.armed = false;
+        status.isolation_pending = true;
+        assert!(status.complete_ipv6_release(receipt.clone()).is_err());
+        status.isolation_pending = false;
+        assert!(status
+            .complete_ipv6_release(Receipt {
+                configuration_active: true,
+                ..receipt.clone()
+            })
+            .is_err());
+        assert!(status.filter_may_exist);
+        status.complete_ipv6_release(receipt).unwrap();
+        assert!(status.dns_modified);
+        assert!(!status.armed && !status.filter_may_exist && !status.ipv6_only);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn incident_stays_latched_until_explicit_release() {
         let mut status = ProtectionStatus {
             armed: true,
@@ -156,6 +216,7 @@ mod tests {
             dns_modified: false,
             filter_may_exist: true,
             ipv6_filtering: true,
+            ipv6_only: false,
             isolation_pending: true,
             receipt: Some(Receipt {
                 diagnostic_logs: None,
@@ -167,6 +228,7 @@ mod tests {
                 generation: None,
                 checked_at: String::new(),
                 detail: String::new(),
+                switched_node: None,
             }),
             error: None,
             baseline: Some(Baseline {

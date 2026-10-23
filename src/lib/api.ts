@@ -69,8 +69,8 @@ let demo: AppSnapshot = {
   dnsServers: [],
   settings: {
     theme: "system",
-    externalIpConsent: false,
-    dnsHttpConsent: false,
+    externalIpConsent: true,
+    dnsHttpConsent: true,
     proxyUrl: "",
     monitorIntervalSec: 0,
     historyDays: 7,
@@ -313,6 +313,10 @@ export async function configureDns(servers: string[]): Promise<void> {
   if (!isNative()) throw new Error("DNS 设置只能在桌面应用中修改。");
   return invoke<void>("configure_dns", { servers });
 }
+export async function applyOverseasDns(): Promise<void> {
+  if (!isNative()) throw new Error("DNS 设置只能在桌面应用中修改。");
+  return invoke<void>("apply_overseas_dns");
+}
 export async function followEgressTimezone(): Promise<TimezoneInfo> {
   if (!isNative()) throw new Error("跟随出口时区只能在桌面应用中执行。");
   return invoke<TimezoneInfo>("follow_egress_timezone");
@@ -320,9 +324,50 @@ export async function followEgressTimezone(): Promise<TimezoneInfo> {
 export async function getDiagnosticLogs(): Promise<DiagnosticEntry[]> {
   return isNative() ? invoke<DiagnosticEntry[]>("get_diagnostic_logs") : [];
 }
-export async function exportDiagnosticLogs(): Promise<
-  import("./types").DiagnosticExport
-> {
+export async function diagnosticLogDirectory(): Promise<string> {
+  if (!isNative()) throw new Error("桌面版才能打开日志文件夹。");
+  return invoke<string>("diagnostic_log_directory");
+}
+export async function pickSaveDirectory(): Promise<string | null> {
+  if (!isNative()) return null;
+  return invoke<string | null>("pick_save_directory");
+}
+export async function openDirectory(path: string): Promise<void> {
+  if (!isNative()) throw new Error("桌面版才能打开文件夹。");
+  return invoke<void>("open_directory", { path });
+}
+export async function exportDiagnosticLogs(
+  destination: string,
+): Promise<import("./types").DiagnosticExport> {
   if (!isNative()) throw new Error("桌面版才能导出诊断日志。");
-  return invoke<import("./types").DiagnosticExport>("export_diagnostic_logs");
+  return invoke<import("./types").DiagnosticExport>("export_diagnostic_logs", {
+    destination,
+  });
+}
+
+export async function getAutostart(): Promise<boolean> {
+  if (!isNative()) return false;
+  return invoke<boolean>("get_autostart");
+}
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  if (!isNative()) throw new Error("请在桌面版中设置开机启动");
+  return invoke<boolean>("set_autostart", { enabled });
+}
+export async function setAutoArm(enabled: boolean): Promise<boolean> {
+  if (!isNative()) throw new Error("请在桌面版中设置自动开启保护");
+  return invoke<boolean>("set_auto_arm", { enabled });
+}
+export async function armAutomatically(): Promise<string> {
+  if (!isNative()) return "";
+  return invoke<string>("arm_automatically");
+}
+export async function scanShortcuts(): Promise<
+  import("./types").AppShortcut[]
+> {
+  if (!isNative()) return [];
+  return invoke<import("./types").AppShortcut[]>("scan_shortcuts");
+}
+export async function launchShortcut(id: string): Promise<void> {
+  if (!isNative()) throw new Error("请在桌面版中启动应用");
+  return invoke<void>("launch_shortcut", { id });
 }

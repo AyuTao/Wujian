@@ -19,6 +19,17 @@ pub fn load(dir: &Path) -> Result<StoredData, String> {
     prune(&mut data);
     Ok(data)
 }
+/// Older files stored the observations as off because that was the default.
+/// Turn them on once. A later save keeps whatever the user chooses.
+pub fn apply_observation_defaults(data: &mut StoredData) -> bool {
+    if data.observation_defaults_applied {
+        return false;
+    }
+    data.settings.external_ip_consent = true;
+    data.settings.dns_http_consent = true;
+    data.observation_defaults_applied = true;
+    true
+}
 pub fn prune(data: &mut StoredData) {
     let cutoff =
         chrono::Utc::now() - chrono::Duration::days(data.settings.history_days.clamp(1, 90) as i64);
@@ -55,4 +66,21 @@ pub fn save(dir: &Path, data: &mut StoredData) -> Result<(), String> {
         let _ = fs::remove_file(temp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_install_turns_observations_on_once() {
+        let mut data: StoredData = serde_json::from_str(
+            r#"{"schemaVersion":1,"settings":{"externalIpConsent":false,"dnsHttpConsent":false},"customTools":[],"events":[]}"#,
+        )
+        .unwrap();
+        assert!(apply_observation_defaults(&mut data));
+        assert!(data.settings.external_ip_consent && data.settings.dns_http_consent);
+        data.settings.dns_http_consent = false;
+        assert!(!apply_observation_defaults(&mut data));
+        assert!(!data.settings.dns_http_consent);
+    }
 }

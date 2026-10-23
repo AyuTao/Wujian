@@ -47,6 +47,23 @@
 body {
   margin: 0;
   min-width: 360px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+button,
+a,
+p,
+span,
+h1,
+h2,
+h3,
+h4,
+label,
+li,
+td,
+th {
+  user-select: text;
+  -webkit-user-select: text;
 }
 button,
 input,

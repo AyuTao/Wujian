@@ -1,5 +1,7 @@
 //! One administrator approval installs a resident root helper.
-//! Timezone changes, protection, DNS, and IPv6 then use its socket and do not prompt again.
+//! Later calls do not prompt when the helper answers.
+//! An explicit action asks once if the helper does not respond.
+//! Background calls pass `allow_prompt` false and stay silent.
 //! The socket only accepts a timezone name or a typed firewall request. It never runs a shell command.
 use serde::{Deserialize, Serialize};
 use std::{
@@ -42,6 +44,7 @@ enum SubmitFail {
     Failed(String),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn declined(dir: &Path) -> bool {
     dir.join(DECLINED).is_file()
 }
@@ -71,13 +74,14 @@ pub async fn apply(tz: &str, app_data: &Path, allow_prompt: bool) -> Result<(), 
         match spawn_submit(move || submit_timezone(&name)).await? {
             Ok(()) => return verified(tz),
             Err(SubmitFail::Failed(error)) => return Err(error),
-            Err(SubmitFail::Unavailable) if Path::new(PLIST).is_file() => {
-                return Err("管理组件未响应；未再次请求授权".into());
+            Err(SubmitFail::Unavailable) if !allow_prompt => {
+                return Err(if Path::new(PLIST).is_file() {
+                    "管理组件未响应；未再次请求授权".into()
+                } else {
+                    "管理组件尚未授权；未修改系统时区".into()
+                });
             }
             Err(SubmitFail::Unavailable) => {}
-        }
-        if !allow_prompt {
-            return Err("管理组件尚未授权；未修改系统时区".into());
         }
         crate::audit::event(
             "admin.connection",
@@ -107,13 +111,14 @@ pub async fn apply(tz: &str, app_data: &Path, allow_prompt: bool) -> Result<(), 
 pub async fn firewall(
     request: crate::firewall::Request,
     app_data: &Path,
+    allow_prompt: bool,
 ) -> Result<crate::firewall::Receipt, String> {
     request.validate()?;
     let probe = request.clone();
     match spawn_submit(move || submit_firewall(&probe)).await? {
         Ok(receipt) => return Ok(receipt),
         Err(SubmitFail::Failed(error)) => return Err(error),
-        Err(SubmitFail::Unavailable) if Path::new(PLIST).is_file() => {
+        Err(SubmitFail::Unavailable) if !allow_prompt => {
             return Err("管理组件未响应；未再次请求授权".into());
         }
         Err(SubmitFail::Unavailable) => {}

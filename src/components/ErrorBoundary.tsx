@@ -1,6 +1,6 @@
 import { Component, type ReactNode } from "react";
 import { captureFrontendEvent } from "../lib/diagnostics";
-import { exportDiagnosticLogs } from "../lib/api";
+import { exportDiagnosticLogs, pickSaveDirectory } from "../lib/api";
 
 export default class ErrorBoundary extends Component<
   { children: ReactNode },
@@ -14,9 +14,14 @@ export default class ErrorBoundary extends Component<
     captureFrontendEvent("frontend.render");
   }
   async exportLogs() {
-    this.setState({ exporting: true });
+    this.setState({ exporting: true, message: "" });
     try {
-      const result = await exportDiagnosticLogs();
+      const directory = await pickSaveDirectory();
+      if (!directory) {
+        this.setState({ message: "已取消保存" });
+        return;
+      }
+      const result = await exportDiagnosticLogs(directory);
       this.setState({
         message: `日志已导出：${result.path}（${result.systemLogs === "included" ? "含系统保护日志" : result.systemLogs === "partial" ? "部分系统保护日志缺失" : "仅 App 日志"}）`,
       });

@@ -11,8 +11,8 @@
 }
 .panel {
   width: 100%;
-  max-width: 480px;
-  max-height: 90dvh;
+  max-width: 540px;
+  max-height: calc(100dvh - 32px);
   overflow-y: auto;
   background: #0a0f1d;
   border: 1px solid rgba(56, 189, 248, 0.35);
@@ -112,4 +112,56 @@
 }
 .message {
   color: #7dd3fc;
+}
+.pathButton {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #e2e8f0;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: left;
+  cursor: pointer;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+.pathButton:hover:not(:disabled) {
+  color: #7dd3fc;
+}
+.logs {
+  max-height: 220px;
+  overflow: auto;
+  user-select: text;
+  white-space: pre-wrap;
+}
+
+.panel section[hidden] {
+  display: none;
+}
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 14px;
+}
+.tabs button {
+  flex: 1;
+}
+.tabs button[aria-pressed="true"] {
+  color: #7dd3fc;
+  background: #15344d;
+  border-color: #38bdf8;
+}
+.startup {
+  font-weight: 600;
+}
+.panel select {
+  color: #e2e8f0;
+  background: #0b1528;
+  border: 1px solid #3e526e;
+  padding: 5px 8px;
+  margin-left: 8px;
+  border-radius: 3px;
 }

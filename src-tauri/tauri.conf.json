@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "無間道 - Dario，我係中國人",
-        "width": 400,
-        "height": 600,
-        "minWidth": 380,
-        "minHeight": 560,
+        "width": 520,
+        "height": 800,
+        "minWidth": 480,
+        "minHeight": 760,
         "resizable": true
       }
     ],

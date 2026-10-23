@@ -25,3 +25,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 maxminddb = { version = "0.32.0", default-features = false }
+tauri-plugin-autostart = "2"

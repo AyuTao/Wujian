@@ -1161,6 +1161,234 @@ pub async fn prepare(uid: u32) -> Result<Policy, String> {
     Ok(policy)
 }
 
+fn line_failure(error: &str) -> bool {
+    if error.contains("国外 DNS") || error.contains("DNS 节点") {
+        return false;
+    }
+    error.contains("节点地址位于中国大陆")
+        || error.contains("节点地址的国家未知")
+        || error.contains("节点地址属于不同国家")
+        || error.contains("节点没有可确认国家的地址")
+        || error.contains("必须最终选择单个代理节点")
+        || error.contains("节点没有公网")
+        || error.contains("节点地址解析")
+        || error.contains("没有选中节点")
+        || error.contains("当前节点类型尚未适配")
+}
+
+fn tun_flap(error: &str) -> bool {
+    error.contains("请开启 TUN") || error.contains("未经过该 TUN") || error.contains("受支持的 TUN")
+}
+
+fn leaf_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "Shadowsocks"
+            | "Vmess"
+            | "VMess"
+            | "Vless"
+            | "VLESS"
+            | "Trojan"
+            | "Hysteria"
+            | "Hysteria2"
+            | "Tuic"
+            | "TUIC"
+            | "Http"
+            | "HTTP"
+            | "Socks"
+            | "SOCKS"
+            | "Socks5"
+            | "WireGuard"
+            | "Ssh"
+            | "Snell"
+    )
+}
+
+fn proxy_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.chars().count() <= 256 && !name.chars().any(|ch| ch.is_control())
+}
+
+struct SwitchPlan {
+    group: String,
+    previous: String,
+    candidates: Vec<String>,
+}
+
+fn switch_plan(proxies: &Value) -> Result<SwitchPlan, String> {
+    let entries = proxies["proxies"]
+        .as_object()
+        .ok_or("客户端没有返回代理信息")?;
+    let now = entries
+        .get("GLOBAL")
+        .and_then(|entry| entry["now"].as_str())
+        .filter(|name| proxy_name_ok(name))
+        .ok_or("策略组当前选择未知")?;
+    let grouped = entries.get(now).is_some_and(|entry| {
+        matches!(
+            entry["type"].as_str(),
+            Some("Selector" | "URLTest" | "Fallback")
+        )
+    });
+    let (group, previous) = if grouped {
+        let inner = entries
+            .get(now)
+            .and_then(|entry| entry["now"].as_str())
+            .filter(|name| proxy_name_ok(name))
+            .ok_or("策略组当前选择未知")?;
+        (now.to_string(), inner.to_string())
+    } else {
+        ("GLOBAL".to_string(), now.to_string())
+    };
+    let all = entries
+        .get(&group)
+        .and_then(|entry| entry["all"].as_array())
+        .ok_or("没有可切换的线路")?;
+    let mut candidates = Vec::new();
+    for item in all {
+        let Some(name) = item.as_str().filter(|name| proxy_name_ok(name)) else {
+            continue;
+        };
+        if name == previous || name == group || matches!(name, "DIRECT" | "REJECT" | "GLOBAL") {
+            continue;
+        }
+        let kind = entries
+            .get(name)
+            .and_then(|entry| entry["type"].as_str())
+            .unwrap_or("");
+        if !leaf_type(kind) {
+            continue;
+        }
+        candidates.push(name.to_string());
+        if candidates.len() == 4 {
+            break;
+        }
+    }
+    Ok(SwitchPlan {
+        group,
+        previous,
+        candidates,
+    })
+}
+
+fn path_segment(name: &str) -> String {
+    let mut out = String::new();
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+async fn put_selection(socket: &str, group: &str, name: &str) -> Result<(), String> {
+    if !proxy_name_ok(group) || !proxy_name_ok(name) {
+        return Err("无法切换线路".into());
+    }
+    let body = serde_json::to_vec(&serde_json::json!({ "name": name }))
+        .map_err(|_| "无法切换线路".to_string())?;
+    let url = format!("http://localhost/proxies/{}", path_segment(group));
+    command::run(
+        &curl_program(),
+        &[
+            "--noproxy",
+            "*",
+            "--silent",
+            "--fail",
+            "--max-time",
+            "3",
+            "--unix-socket",
+            socket,
+            "-X",
+            "PUT",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            &url,
+        ],
+        Some(&body),
+    )
+    .await
+    .map_err(|_| "无法切换线路".to_string())?;
+    Ok(())
+}
+
+async fn restore_selection(socket: &str, plan: &SwitchPlan) -> Result<(), String> {
+    if plan.previous.is_empty() {
+        return Ok(());
+    }
+    put_selection(socket, &plan.group, &plan.previous).await
+}
+
+/// Prepare the current node. When that node itself is unqualified, try a few
+/// other concrete lines in the same group, then put the previous choice back.
+pub async fn prepare_switching(uid: u32) -> Result<(Policy, Option<String>), String> {
+    match prepare(uid).await {
+        Ok(policy) => Ok((policy, None)),
+        Err(error) if !line_failure(&error) => Err(error),
+        Err(first) => switch_after(uid, first).await,
+    }
+}
+
+async fn switch_after(uid: u32, first: String) -> Result<(Policy, Option<String>), String> {
+    let controller = open_controller(uid)
+        .await
+        .map_err(|error| format!("{first}。未能改选线路：{error}"))?;
+    let proxies = curl_json(&controller.socket, "proxies")
+        .await
+        .map_err(|error| format!("{first}。未能改选线路：{error}"))?;
+    let Ok(plan) = switch_plan(&proxies) else {
+        return Err(first);
+    };
+    if plan.candidates.is_empty() {
+        return Err(first);
+    }
+    let mut changed = false;
+    for candidate in &plan.candidates {
+        if put_selection(&controller.socket, &plan.group, candidate)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        changed = true;
+        for _ in 0..2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            match prepare(uid).await {
+                Ok(policy) => {
+                    let name = policy
+                        .tunnel_guard
+                        .as_ref()
+                        .map(|guard| guard.node.clone())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| candidate.clone());
+                    return Ok((policy, Some(name)));
+                }
+                Err(error) if line_failure(&error) || tun_flap(&error) => continue,
+                Err(error) => {
+                    return Err(match restore_selection(&controller.socket, &plan).await {
+                        Ok(()) => error,
+                        Err(restore_error) => {
+                            format!("{error}。切回原来的线路失败：{restore_error}")
+                        }
+                    });
+                }
+            }
+        }
+    }
+    if !changed {
+        return Err(first);
+    }
+    match restore_selection(&controller.socket, &plan).await {
+        Ok(()) => Err(format!("{first}。其他线路也不合格，已切回原来的线路")),
+        Err(restore_error) => Err(format!(
+            "{first}。其他线路也不合格，切回原来的线路失败：{restore_error}"
+        )),
+    }
+}
+
 fn endpoint_matches(guard: &TunnelGuard, live: &Observed) -> Result<(), String> {
     if live.chain != guard.selected_chain
         || live.server != guard.server
@@ -1365,6 +1593,43 @@ mod tests {
         assert!(home_from_directory_service("uid: 501\ndir: ../etc\n", 501).is_err());
         assert!(home_from_directory_service("uid: 501\ndir: relative\n", 501).is_err());
         assert!(home_from_directory_service("uid: 501\n", 501).is_err());
+    }
+    #[test]
+    fn line_switch_only_replaces_an_unqualified_node() {
+        assert!(line_failure("节点地址位于中国大陆，不能当作国外出口"));
+        assert!(line_failure(
+            "GLOBAL 必须最终选择单个代理节点；直连、负载均衡及链式代理暂不支持"
+        ));
+        assert!(!line_failure("请开启 TUN"));
+        assert!(!line_failure("请开启全局模式"));
+        assert!(!line_failure("找不到 Country.mmdb，无法确认节点在国外"));
+        assert!(!line_failure("DNS 节点没有公网 IPv4"));
+        assert!(!tun_flap("节点地址位于中国大陆"));
+        assert!(tun_flap("请开启 TUN"));
+        let nested = serde_json::json!({"proxies":{
+            "GLOBAL":{"type":"Selector","now":"香港","all":["香港","日本"]},
+            "香港":{"type":"Selector","now":"HK-1","all":["HK-1","HK-2","DIRECT"]},
+            "HK-1":{"type":"Trojan"},
+            "HK-2":{"type":"Shadowsocks"},
+            "日本":{"type":"Selector","now":"JP-1","all":["JP-1"]},
+            "JP-1":{"type":"Vmess"}
+        }});
+        let plan = switch_plan(&nested).unwrap();
+        assert_eq!(plan.group, "香港");
+        assert_eq!(plan.previous, "HK-1");
+        assert_eq!(plan.candidates, vec!["HK-2".to_string()]);
+        let leaf = serde_json::json!({"proxies":{
+            "GLOBAL":{"type":"Selector","now":"HK-1","all":["HK-1","HK-2","日本"]},
+            "HK-1":{"type":"Trojan"},
+            "HK-2":{"type":"Vmess"},
+            "日本":{"type":"Selector","now":"JP-1"}
+        }});
+        let plan = switch_plan(&leaf).unwrap();
+        assert_eq!(plan.group, "GLOBAL");
+        assert_eq!(plan.previous, "HK-1");
+        assert_eq!(plan.candidates, vec!["HK-2".to_string()]);
+        assert_eq!(path_segment("HK-1"), "HK-1");
+        assert_eq!(path_segment("香港"), "%E9%A6%99%E6%B8%AF");
     }
     #[test]
     fn follows_nested_selection_and_rejects_direct_cycles_and_unknown() {

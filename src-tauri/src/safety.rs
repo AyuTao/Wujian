@@ -22,24 +22,12 @@ pub(crate) fn global_report(
                 gate.detail = "出口观测供参考；变化会记录提醒，不用出口 IP 轮询决定防回落。".into();
             }
             "gate-timezone" => {
-                if settings.timezone_mode == "egress" {
-                    let follow = checks.iter().find(|c| c.id == "timezone-follow");
-                    gate.passed =
-                        follow.is_some_and(|c| c.status == "match" && fresh(c, chrono::Utc::now()));
-                    gate.detail = follow
-                        .map(|c| c.detail.clone())
-                        .unwrap_or_else(|| "等待查询出口城市时区".into());
-                } else {
-                    gate.passed = checks.iter().any(|c| {
-                        c.id == "timezone"
-                            && fresh(c, chrono::Utc::now())
-                            && settings.target_timezone.as_deref().is_none_or(|target| {
-                                crate::platform::timezone_matches(&c.value, target)
-                            })
-                    });
-                    gate.detail =
-                        "手动时区模式；有自定义目标时按目标核对，不作为全局保护的断网条件。".into();
-                }
+                let follow = checks.iter().find(|c| c.id == "timezone-follow");
+                gate.passed =
+                    follow.is_some_and(|c| c.status == "match" && fresh(c, chrono::Utc::now()));
+                gate.detail = follow.map(|c| c.detail.clone()).unwrap_or_else(|| {
+                    "时区跟随出口 IP。开启保护时若仍是中国大陆时区，会切断公网。".into()
+                });
             }
             "gate-dns" => {
                 gate.detail =

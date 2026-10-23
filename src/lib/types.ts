@@ -59,6 +59,7 @@ export interface Settings {
   targetTimezone?: string | null;
   timezoneMode?: "manual" | "egress";
   geoipDatabasePath?: string | null;
+  autoArm?: boolean;
 }
 
 export interface TimezoneInfo {
@@ -146,6 +147,7 @@ export interface ProtectionStatus {
   dnsModified?: boolean;
   filterMayExist?: boolean;
   ipv6Filtering?: boolean;
+  ipv6Only?: boolean;
   receipt: FirewallReceipt | null;
   error: string | null;
 }
@@ -169,4 +171,9 @@ export interface DiagnosticExport {
   path: string;
   systemLogs: "included" | "partial" | "unavailable";
   appHealthy: boolean;
+}
+
+export interface AppShortcut {
+  id: string;
+  name: string;
 }

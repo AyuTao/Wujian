@@ -14,13 +14,14 @@ pub struct Settings {
     pub target_timezone: Option<String>,
     pub timezone_mode: String,
     pub geoip_database_path: Option<String>,
+    pub auto_arm: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "system".into(),
-            external_ip_consent: false,
-            dns_http_consent: false,
+            external_ip_consent: true,
+            dns_http_consent: true,
             proxy_url: String::new(),
             monitor_interval_sec: 0,
             history_days: 7,
@@ -29,7 +30,18 @@ impl Default for Settings {
             target_timezone: None,
             timezone_mode: "manual".into(),
             geoip_database_path: None,
+            auto_arm: false,
         }
+    }
+}
+impl Settings {
+    /// Saved manual mode is promoted at launch. Empty JSON still deserializes as manual.
+    pub fn promote_egress_timezone(&mut self) -> bool {
+        if self.timezone_mode == "egress" {
+            return false;
+        }
+        self.timezone_mode = "egress".into();
+        true
     }
 }
 #[cfg(test)]
@@ -39,7 +51,10 @@ mod timezone_settings_tests {
     fn previous_settings_keep_manual_mode_and_follow_requires_consent() {
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.timezone_mode, "manual");
+        assert!(!settings.auto_arm);
+        assert!(settings.external_ip_consent && settings.dns_http_consent);
         settings.timezone_mode = "egress".into();
+        settings.external_ip_consent = false;
         assert!(crate::probes::validate_settings(&settings).is_err());
         settings.external_ip_consent = true;
         assert!(crate::probes::validate_settings(&settings).is_ok());
@@ -50,6 +65,13 @@ mod timezone_settings_tests {
                 .timezone_mode,
             "egress"
         );
+    }
+    #[test]
+    fn saved_manual_mode_is_promoted_to_egress_follow() {
+        let mut settings: Settings = serde_json::from_str(r#"{"timezoneMode":"manual"}"#).unwrap();
+        assert!(settings.promote_egress_timezone());
+        assert_eq!(settings.timezone_mode, "egress");
+        assert!(!settings.promote_egress_timezone());
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -196,6 +218,9 @@ pub struct StoredData {
     pub settings: Settings,
     pub custom_tools: Vec<ToolInfo>,
     pub events: Vec<HistoryEvent>,
+    /// Old installs saved both observations off. Apply the new default once.
+    #[serde(default)]
+    pub observation_defaults_applied: bool,
 }
 impl Default for StoredData {
     fn default() -> Self {
@@ -204,6 +229,7 @@ impl Default for StoredData {
             settings: Settings::default(),
             custom_tools: vec![],
             events: vec![],
+            observation_defaults_applied: true,
         }
     }
 }

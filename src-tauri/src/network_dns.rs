@@ -12,6 +12,23 @@ use std::{
 pub struct Change {
     pub servers: Vec<IpAddr>,
 }
+pub(crate) fn overseas_system_dns() -> Vec<IpAddr> {
+    vec![
+        IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
+    ]
+}
+
+/// Drop the rollback journal after an explicit overseas DNS write.
+/// Stopping protection must not put the previous resolvers back.
+pub(crate) fn discard_recovery(dir: &Path) -> Result<(), String> {
+    let path = dir.join("network-recovery.json");
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|_| "海外 DNS 已写入，原始记录已保留")?;
+    }
+    Ok(())
+}
+
 impl Change {
     pub fn validate(&self) -> Result<(), String> {
         if self.servers.is_empty()
@@ -145,10 +162,7 @@ fn service_order(text: &str) -> Vec<(String, String)> {
         } else if let Some((_, dev)) = line.split_once("Device: ") {
             if let Some(name) = name.take() {
                 let dev = dev.trim_end_matches(')');
-                if dev
-                    .strip_prefix("en")
-                    .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                {
+                if physical_nic(dev) {
                     result.push((name, dev.into()));
                 }
             }
@@ -156,6 +170,18 @@ fn service_order(text: &str) -> Vec<(String, String)> {
     }
     result
 }
+#[cfg(target_os = "macos")]
+fn physical_nic(dev: &str) -> bool {
+    dev.strip_prefix("en")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[cfg(target_os = "macos")]
+fn interface_missing(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("does not exist") || error.contains("不存在")
+}
+
 fn addresses(text: &str) -> Result<Vec<String>, String> {
     let values: Vec<_> = text.split_whitespace().map(str::to_string).collect();
     if values.iter().any(|s| {
@@ -179,7 +205,14 @@ async fn capture() -> Result<Vec<Backup>, String> {
         let list = cmd("/usr/sbin/networksetup", &["-listnetworkserviceorder"]).await?;
         let mut result = vec![];
         for (service, dev) in service_order(&list) {
-            let info = cmd("/sbin/ifconfig", &[&dev]).await?;
+            if !physical_nic(&dev) {
+                continue;
+            }
+            let info = match cmd("/sbin/ifconfig", &[&dev]).await {
+                Ok(info) => info,
+                Err(error) if interface_missing(&error) => continue,
+                Err(error) => return Err(error),
+            };
             if !info.lines().any(|l| l.trim() == "status: active") {
                 continue;
             }
@@ -335,43 +368,67 @@ pub(crate) async fn execute(
     dir: &Path,
 ) -> Result<crate::firewall::Receipt, String> {
     let path = dir.join("network-recovery.json");
-    if action == "network-apply" {
+    if action == "network-apply" || action == "network-apply-keep" {
+        let keep = action == "network-apply-keep";
         let change = change.ok_or("缺少 DNS 设置")?;
         change.validate()?;
         for server in &change.servers {
             probe(*server).await?;
         }
-        if path.exists() {
-            return Err("已有 DNS 修改等待恢复，请先还原后再修改".into());
-        }
-        let original = capture().await?;
-        if original.is_empty() {
+        let current = capture().await?;
+        if current.is_empty() {
             return Err("没有可修改的活动物理网卡".into());
         }
-        let mut journal = Journal {
-            platform: std::env::consts::OS.into(),
-            original,
-            pending: vec![],
-        };
-        save(dir, &journal)?; // durable original state BEFORE the first mutation
-        for n in 0..journal.original.len() {
-            journal.pending.push(n);
-            save(dir, &journal)?; // write-ahead per adapter
-            let next = Backup {
-                service: journal.original[n].service.clone(),
-                automatic: false,
-                servers: change.servers.iter().map(ToString::to_string).collect(),
-            };
-            if let Err(e) = set(&next).await {
-                return Err(format!(
-                    "DNS 配置未完成：{e}；请使用恢复按钮，原始记录已保留"
-                ));
+        let servers: Vec<String> = change.servers.iter().map(ToString::to_string).collect();
+        if path.exists() {
+            if !keep {
+                return Err("已有 DNS 修改等待恢复，请先还原后再修改".into());
             }
+            // Keep the existing journal until every adapter is written, so a
+            // failed attempt can still restore the pre-change resolvers.
+            for backup in &current {
+                let next = Backup {
+                    service: backup.service.clone(),
+                    automatic: false,
+                    servers: servers.clone(),
+                };
+                if let Err(e) = set(&next).await {
+                    return Err(format!("DNS 配置未完成：{e}；原始记录已保留"));
+                }
+            }
+        } else {
+            let mut journal = Journal {
+                platform: std::env::consts::OS.into(),
+                original: current,
+                pending: vec![],
+            };
+            save(dir, &journal)?; // durable original state BEFORE the first mutation
+            for n in 0..journal.original.len() {
+                journal.pending.push(n);
+                save(dir, &journal)?; // write-ahead per adapter
+                let next = Backup {
+                    service: journal.original[n].service.clone(),
+                    automatic: false,
+                    servers: servers.clone(),
+                };
+                if let Err(e) = set(&next).await {
+                    return Err(format!(
+                        "DNS 配置未完成：{e}；请使用恢复按钮，原始记录已保留"
+                    ));
+                }
+            }
+        }
+        if keep {
+            discard_recovery(dir)?;
         }
         Ok(crate::firewall::Receipt::new(
             true,
             None,
-            "IPv4 DNS 已修改并回读；这是配置状态，不证明 DNS 无泄漏。",
+            if keep {
+                "系统 DNS 已改为 1.1.1.1、1.0.0.1。"
+            } else {
+                "IPv4 DNS 已修改并回读；这是配置状态，不证明 DNS 无泄漏。"
+            },
         ))
     } else if action == "network-release" {
         if !path.exists() {
@@ -403,6 +460,41 @@ pub(crate) async fn execute(
 mod tests {
     use super::*;
     #[test]
+    fn overseas_system_dns_is_cloudflare_and_sticks_after_the_journal_is_dropped() {
+        let servers = overseas_system_dns();
+        assert_eq!(
+            servers,
+            vec![
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                "1.0.0.1".parse().unwrap()
+            ]
+        );
+        assert!(Change {
+            servers: servers.clone()
+        }
+        .validate()
+        .is_ok());
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        save(
+            &dir,
+            &Journal {
+                platform: std::env::consts::OS.into(),
+                original: vec![Backup {
+                    service: "Wi-Fi".into(),
+                    automatic: false,
+                    servers: vec!["114.114.114.114".into()],
+                }],
+                pending: vec![0],
+            },
+        )
+        .unwrap();
+        discard_recovery(&dir).unwrap();
+        assert!(!dir.join("network-recovery.json").exists());
+        discard_recovery(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn validation_never_accepts_commands_or_unknown_addresses() {
         assert!(Change { servers: vec![] }.validate().is_err());
         assert!(Change {
@@ -417,6 +509,22 @@ mod tests {
     fn only_enabled_physical_services_are_selected() {
         let text = "(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n(*) Disabled\n(Hardware Port: Ethernet, Device: en1)\n(2) VPN\n(Hardware Port: VPN, Device: utun6)";
         assert_eq!(service_order(text), vec![("Wi-Fi".into(), "en0".into())]);
+        let ghost = "(3) iPhone USB\n(Hardware Port: iPhone USB, Device: en9)\n(4) Index\n(Hardware Port: USB, Device: 7)\n(5) LAN\n(Hardware Port: USB LAN, Device: en7)";
+        assert_eq!(
+            service_order(ghost),
+            vec![
+                ("iPhone USB".into(), "en9".into()),
+                ("LAN".into(), "en7".into())
+            ]
+        );
+        assert!(physical_nic("en0") && physical_nic("en7"));
+        assert!(!physical_nic("7") && !physical_nic("en") && !physical_nic("utun6"));
+        assert!(interface_missing(
+            "系统操作失败：ifconfig: interface 7 does not exist"
+        ));
+        assert!(interface_missing("ifconfig: interface en9 does not exist"));
+        assert!(interface_missing("接口不存在"));
+        assert!(!interface_missing("系统操作失败：permission denied"));
     }
     #[test]
     fn malformed_empty_and_truncated_dns_responses_are_not_available() {

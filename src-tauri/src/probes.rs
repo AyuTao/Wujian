@@ -217,7 +217,7 @@ async fn probe_egress(settings: &Settings, network: &NetworkInfo) -> Vec<CheckRe
     let results = async {
     let proxy = !settings.proxy_url.trim().is_empty();
     let mut results = vec![];
-    let unsafe_default = !proxy && (network.app_proxy_present || !network.proxy_readable);
+    let _ = (network.app_proxy_present, network.proxy_readable);
     if !settings.external_ip_consent {
         results.push(external_result(
             "egress-ipv4",
@@ -228,8 +228,6 @@ async fn probe_egress(settings: &Settings, network: &NetworkInfo) -> Vec<CheckRe
             proxy,
             false,
         ));
-    } else if unsafe_default {
-        results.push(external_result("egress-ipv4", "公网 IPv4 出口", "unknown", "请先明确检测代理", "检测到应用代理或无法读取相关配置；为避免绕过现有设置，本次未发起请求。请在设置填写要使用的代理。", proxy, false));
     } else {
         let observed = async {
             let client = client(settings, None)?;
@@ -414,12 +412,11 @@ fn accept_iana_timezone(tz: &str) -> Result<String, String> {
     Ok(tz.to_string())
 }
 
-async fn probe_dns(settings: &Settings, network: &NetworkInfo) -> Vec<CheckResult> {
+async fn probe_dns(settings: &Settings, _network: &NetworkInfo) -> Vec<CheckResult> {
     let started = std::time::Instant::now();
     let results = async {
     let proxy = !settings.proxy_url.trim().is_empty();
     let mut results = vec![];
-    let unsafe_default = !proxy && (network.app_proxy_present || !network.proxy_readable);
     if !settings.dns_http_consent {
         results.push(external_result(
             "dns-observation",
@@ -427,16 +424,6 @@ async fn probe_dns(settings: &Settings, network: &NetworkInfo) -> Vec<CheckResul
             "not_run",
             "尚未授权 HTTP DNS 观测",
             "该非商业接口使用随机测试域名；服务会看到解析与请求相关信息。当前没有发起该请求。",
-            proxy,
-            true,
-        ));
-    } else if unsafe_default {
-        results.push(external_result(
-            "dns-observation",
-            "DNS 解析出口观测",
-            "unknown",
-            "请先明确检测代理",
-            "为避免绕过已有代理设置，本次未发起 DNS 观测。",
             proxy,
             true,
         ));
@@ -565,10 +552,10 @@ mod tests {
     #[test]
     fn authorized_observations_refresh_even_without_firewall_monitoring() {
         let mut settings = Settings::default();
-        assert_eq!(refresh_interval(&settings, false), None);
-        settings.external_ip_consent = true;
         assert_eq!(refresh_interval(&settings, false), Some(15));
         settings.external_ip_consent = false;
+        settings.dns_http_consent = false;
+        assert_eq!(refresh_interval(&settings, false), None);
         settings.dns_http_consent = true;
         assert_eq!(refresh_interval(&settings, false), Some(15));
         settings.monitor_interval_sec = 60;

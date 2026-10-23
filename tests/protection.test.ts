@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { protectionLabel } from "../src/lib/protection";
+import {
+  protectionLabel,
+  needsProtectionRecovery,
+} from "../src/lib/protection";
 import type { ProtectionStatus } from "../src/lib/types";
 
 describe("native isolation status", () => {
@@ -79,6 +82,29 @@ describe("native isolation status", () => {
     expect(protectionLabel({ ...status, receipt: null })).toBe("保护未确认");
     expect(protectionLabel({ ...status, isolationPending: true })).toBe(
       "隔断未确认",
+    );
+  });
+});
+
+describe("independent IPv6 UI", () => {
+  const base: ProtectionStatus = {
+    armed: false,
+    isolationPending: false,
+    filterMayExist: true,
+    receipt: null,
+    error: null,
+  };
+  it("does not offer whole-machine isolation recovery for independent IPv6, including after restart or failure", () => {
+    expect(needsProtectionRecovery(base)).toBe(true);
+    expect(needsProtectionRecovery({ ...base, ipv6Filtering: true })).toBe(
+      false,
+    );
+    const ipv6 = { ...base, ipv6Only: true };
+    expect(needsProtectionRecovery(ipv6)).toBe(false);
+    expect(needsProtectionRecovery({ ...ipv6, error: "授权取消" })).toBe(false);
+    expect(protectionLabel(ipv6)).toBe("IPv6 规则待核验");
+    expect(needsProtectionRecovery({ ...ipv6, isolationPending: true })).toBe(
+      true,
     );
   });
 });

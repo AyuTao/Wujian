@@ -1,20 +1,34 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   saveSettings,
+  getAutostart,
+  setAutostart,
+  setAutoArm,
+  armAutomatically,
   runChecks,
   getDiagnosticLogs,
+  diagnosticLogDirectory,
+  pickSaveDirectory,
+  openDirectory,
   exportDiagnosticLogs,
   firewallAction,
   isNative,
   configureDns,
-  toggleGate,
   followEgressTimezone,
-  restoreTimezone,
 } from "../lib/api";
 import type { AppSnapshot, DiagnosticEntry } from "../lib/types";
+import { notifyError, notifyOk } from "../lib/notify";
 import { protectionLabel } from "../lib/protection";
 import styles from "./SettingsDialog.module.css";
 import { systemDnsAddresses } from "../lib/dnsConfig";
+
+function logLine(entry: DiagnosticEntry): string {
+  return `${entry.at} [${entry.source || "legacy"}] ${entry.operation} ${entry.outcome}${entry.errorKind ? ` (${entry.errorKind})` : ""}${entry.durationMs != null ? ` ${entry.durationMs}ms` : ""}${entry.operationId ? ` #${entry.operationId.slice(0, 8)}` : ""}`;
+}
+function parentDirectory(file: string): string {
+  const slash = Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\"));
+  return slash > 0 ? file.slice(0, slash) : file;
+}
 
 export default function SettingsDialog({
   snapshot,
@@ -29,35 +43,48 @@ export default function SettingsDialog({
 }) {
   const [settings, setSettings] = useState(snapshot.settings);
   const [pending, setPending] = useState(false);
-  const [message, setMessage] = useState("");
-  const [error, setError] = useState("");
   const [logs, setLogs] = useState<DiagnosticEntry[]>([]);
+  const [logDir, setLogDir] = useState("");
+  const [exportPath, setExportPath] = useState("");
   const [dnsInput, setDnsInput] = useState(snapshot.dnsServers.join(", "));
-  const dnsSection = useRef<HTMLElement>(null);
-  const timezoneSection = useRef<HTMLLabelElement>(null);
+  const [tab, setTab] = useState<"general" | "dns" | "logs">(
+    initialSection === "dns" ? "dns" : "general",
+  );
+  const [autostart, setAutostartValue] = useState<boolean | null>(null);
   useEffect(() => {
-    if (initialSection === "dns")
-      dnsSection.current?.scrollIntoView({ block: "start" });
-    if (initialSection === "timezone")
-      timezoneSection.current?.scrollIntoView({ block: "start" });
-  }, [initialSection]);
+    let active = true;
+    getAutostart()
+      .then((value) => {
+        if (active) setAutostartValue(value);
+      })
+      .catch((e) => {
+        if (active) notifyError(String(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!isNative()) return;
+    diagnosticLogDirectory()
+      .then(setLogDir)
+      .catch(() => setLogDir(""));
+  }, []);
   const native = isNative();
   const policyLocked = Boolean(
     snapshot.protection?.armed || snapshot.protection?.isolationPending,
   );
   async function perform(action: () => Promise<void>) {
     setPending(true);
-    setError("");
-    setMessage("");
     try {
       await action();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      notifyError(e instanceof Error ? e.message : String(e));
     } finally {
       try {
         await onRefresh();
       } catch (e) {
-        setError(String(e));
+        notifyError(String(e));
       }
       setPending(false);
     }
@@ -120,17 +147,74 @@ export default function SettingsDialog({
               </div>
             )}
         </section>
-        <section>
-          <h4>检测</h4>
+        <nav className={styles.tabs} aria-label="设置分类">
+          {(
+            [
+              ["general", "启动与检测"],
+              ["dns", "DNS"],
+              ["logs", "日志"],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              aria-pressed={tab === id}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        <section hidden={tab !== "general"}>
+          <label className={styles.startup}>
+            <input
+              type="checkbox"
+              checked={autostart === true}
+              disabled={pending || !native || autostart === null}
+              onChange={(e) => {
+                const enabled = e.target.checked;
+                void perform(async () => {
+                  setAutostartValue(await setAutostart(enabled));
+                  notifyOk(
+                    enabled ? "已开启登录后自动启动" : "已关闭开机自动启动",
+                  );
+                });
+              }}
+            />
+            开机自动启动
+          </label>
+          <p className={styles.hint}>登录后打开 App。</p>
+          <label className={styles.startup}>
+            <input
+              type="checkbox"
+              checked={settings.autoArm === true}
+              disabled={pending || !native}
+              onChange={(e) => {
+                const enabled = e.target.checked;
+                void perform(async () => {
+                  await setAutoArm(enabled);
+                  setSettings((current) => ({ ...current, autoArm: enabled }));
+                  if (!enabled) {
+                    notifyOk("已关闭登录后自动开启保护");
+                    return;
+                  }
+                  const message = await armAutomatically();
+                  notifyOk(message || "已开启登录后自动开启保护");
+                });
+              }}
+            />
+            登录后自动开启保护
+          </label>
+          <p className={styles.hint}>当前线路不合格时，改选下一条可用线路。</p>
+          <h4>检测与时区</h4>
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void perform(async () => {
-                setSettings(await saveSettings(settings));
-                if (settings.timezoneMode === "egress")
-                  await followEgressTimezone();
+                const next = { ...settings, timezoneMode: "egress" as const };
+                setSettings(await saveSettings(next));
+                await followEgressTimezone();
                 await runChecks(snapshot.networkEpoch, "settings");
-                setMessage("已保存");
+                notifyOk("已保存");
               });
             }}
           >
@@ -159,140 +243,77 @@ export default function SettingsDialog({
               />
               观测 DNS
             </label>
-            <label ref={timezoneSection}>
-              时区
-              <select
-                disabled={pending || policyLocked}
-                value={settings.timezoneMode ?? "manual"}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    timezoneMode: e.target.value as "manual" | "egress",
-                    externalIpConsent:
-                      e.target.value === "egress"
-                        ? true
-                        : settings.externalIpConsent,
-                  })
-                }
-              >
-                <option value="egress">跟随出口</option>
-                <option value="manual">手动</option>
-              </select>
-            </label>
-            {snapshot.settings.timezoneMode === "egress" && (
-              <p className={styles.hint} role="status">
-                {snapshot.checks.find((check) => check.id === "timezone-follow")
-                  ?.value ?? "等待出口"}
-              </p>
-            )}
-            <label>
-              手动时区
-              <input
-                disabled={
-                  pending || policyLocked || settings.timezoneMode === "egress"
-                }
-                value={settings.targetTimezone ?? ""}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    targetTimezone: e.target.value.trim() || null,
-                  })
-                }
-                placeholder="Asia/Shanghai"
-                spellCheck={false}
-              />
-            </label>
+            <p className={styles.hint}>时区跟随出口 IP。</p>
             {policyLocked && (
               <p className={styles.hint}>保护中不能改这些设置。</p>
             )}
             <div className={styles.actions}>
               <button disabled={pending || policyLocked}>保存</button>
-              {settings.timezoneMode === "egress" && (
-                <button
-                  type="button"
-                  disabled={
-                    pending ||
-                    !native ||
-                    snapshot.protection?.isolationPending ||
-                    Boolean(
-                      snapshot.protection?.armed &&
-                      !snapshot.protection?.tunnelGuardConfirmed,
-                    )
-                  }
-                  onClick={() =>
-                    void perform(async () => {
-                      if (!policyLocked)
-                        setSettings(await saveSettings(settings));
-                      const tz = await followEgressTimezone();
-                      await runChecks(snapshot.networkEpoch, "settings");
-                      setMessage(`时区已设为 ${tz.current}`);
-                    })
-                  }
-                >
-                  跟随出口
-                </button>
-              )}
               <button
                 type="button"
                 disabled={
                   pending ||
-                  policyLocked ||
-                  !settings.targetTimezone ||
                   !native ||
-                  settings.timezoneMode === "egress"
+                  snapshot.protection?.isolationPending ||
+                  Boolean(
+                    snapshot.protection?.armed &&
+                    !snapshot.protection?.tunnelGuardConfirmed,
+                  )
                 }
                 onClick={() =>
                   void perform(async () => {
-                    setSettings(
-                      await saveSettings({
-                        ...settings,
-                        timezoneMode: "manual",
-                      }),
-                    );
-                    await toggleGate("gate-timezone", true);
+                    const tz = await followEgressTimezone();
                     await runChecks(snapshot.networkEpoch, "settings");
-                    setMessage("已应用指定时区。");
+                    notifyOk(`时区已设为 ${tz.current}`);
                   })
                 }
               >
-                应用手动时区
+                立即跟随
               </button>
-              {snapshot.settings.originalTimezone && (
-                <button
-                  type="button"
-                  disabled={pending || policyLocked || !native}
-                  onClick={() =>
-                    void perform(async () => {
-                      const tz = await restoreTimezone();
-                      setSettings({
-                        ...settings,
-                        timezoneMode: "manual",
-                        originalTimezone: null,
-                        targetTimezone: tz.current,
-                      });
-                      await runChecks(snapshot.networkEpoch, "settings");
-                      setMessage("已恢复原时区");
-                    })
-                  }
-                >
-                  恢复原时区
-                </button>
-              )}
             </div>
           </form>
         </section>
-        <section ref={dnsSection}>
+        <section hidden={tab !== "dns"}>
           <h4>DNS</h4>
           <p className={styles.hint}>
             {snapshot.dnsServers.join("、") || "系统 DNS 未知"}
           </p>
+          <p className={styles.hint}>海外公共 DNS 预设</p>
+          <div className={styles.actions}>
+            {[
+              { name: "Cloudflare", servers: ["1.1.1.1", "1.0.0.1"] },
+              { name: "Google", servers: ["8.8.8.8", "8.8.4.4"] },
+            ].map((preset) => (
+              <button
+                key={preset.name}
+                disabled={pending || policyLocked || !native}
+                onClick={() =>
+                  void perform(async () => {
+                    await configureDns(preset.servers);
+                    setDnsInput(preset.servers.join(", "));
+                    await runChecks(snapshot.networkEpoch, "settings");
+                    notifyOk(`已应用 ${preset.name} DNS，原配置已备份`);
+                  })
+                }
+              >
+                使用 {preset.name}
+              </button>
+            ))}
+          </div>
+          <p className={styles.hint}>
+            修改系统 DNS；实际解析位置以检测为准。代理客户端的内部 DNS
+            需在客户端设置。
+          </p>
+          {policyLocked && (
+            <p className={styles.hint}>请先停止整机保护，再修改 DNS。</p>
+          )}
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void perform(async () => {
                 await configureDns(systemDnsAddresses(dnsInput));
                 await runChecks(snapshot.networkEpoch, "settings");
-                setMessage("系统 DNS 已写入");
+                notifyOk("系统 DNS 已写入");
               });
             }}
           >
@@ -302,25 +323,36 @@ export default function SettingsDialog({
                 disabled={pending || policyLocked || !native}
                 value={dnsInput}
                 onChange={(e) => setDnsInput(e.target.value)}
-                placeholder="223.5.5.5, 114.114.114.114"
+                placeholder="1.1.1.1, 1.0.0.1"
                 spellCheck={false}
               />
             </label>
             <button disabled={pending || policyLocked || !native}>写入</button>
           </form>
         </section>
-        <section>
+        <section hidden={tab !== "logs"}>
           <h4>日志</h4>
-          <p className={styles.hint}>
-            导出会收集 App 和系统保护日志。Windows/Linux
-            可能请求管理员权限；取消后仍导出 App 日志。
-          </p>
+          {logDir && (
+            <button
+              type="button"
+              className={styles.pathButton}
+              disabled={pending || !native}
+              onClick={() =>
+                void perform(async () => {
+                  await openDirectory(logDir);
+                })
+              }
+            >
+              {logDir}
+            </button>
+          )}
           <div className={styles.actions}>
             <button
               disabled={pending}
               onClick={() =>
                 void perform(async () => {
                   setLogs(await getDiagnosticLogs());
+                  notifyOk("已显示最近日志");
                 })
               }
             >
@@ -330,9 +362,19 @@ export default function SettingsDialog({
               disabled={pending || !native}
               onClick={() =>
                 void perform(async () => {
-                  const result = await exportDiagnosticLogs();
-                  setMessage(
-                    `日志已导出：${result.path}（${result.systemLogs === "included" ? "含系统保护日志" : result.systemLogs === "partial" ? "部分系统保护日志缺失" : "仅 App 日志，系统保护日志未收集"}）${result.appHealthy ? "" : "；日志健康检查发现缺失，详见导出文件。"}`,
+                  const directory = await pickSaveDirectory();
+                  if (!directory) {
+                    notifyOk("已取消保存");
+                    return;
+                  }
+                  const result = await exportDiagnosticLogs(directory);
+                  setExportPath(result.path);
+                  notifyOk(
+                    result.systemLogs === "included"
+                      ? "已保存，含系统保护日志"
+                      : result.systemLogs === "partial"
+                        ? "已保存，部分系统保护日志缺失"
+                        : "已保存，仅 App 日志",
                   );
                 })
               }
@@ -340,27 +382,24 @@ export default function SettingsDialog({
               导出
             </button>
           </div>
+          {exportPath && (
+            <button
+              type="button"
+              className={styles.pathButton}
+              disabled={pending || !native}
+              onClick={() =>
+                void perform(async () => {
+                  await openDirectory(parentDirectory(exportPath));
+                })
+              }
+            >
+              {exportPath}
+            </button>
+          )}
           {logs.length > 0 && (
-            <pre>
-              {logs
-                .map(
-                  (l) =>
-                    `${l.at} [${l.source || "legacy"}] ${l.operation} ${l.outcome}${l.errorKind ? ` (${l.errorKind})` : ""}${l.durationMs != null ? ` ${l.durationMs}ms` : ""}${l.operationId ? ` #${l.operationId.slice(0, 8)}` : ""}`,
-                )
-                .join("\n")}
-            </pre>
+            <pre className={styles.logs}>{logs.map(logLine).join("\n")}</pre>
           )}
         </section>
-        {error && (
-          <p className={styles.error} role="alert">
-            {error}
-          </p>
-        )}
-        {message && (
-          <p className={styles.message} role="status">
-            {message}
-          </p>
-        )}
       </div>
     </div>
   );

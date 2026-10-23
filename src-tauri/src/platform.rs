@@ -17,6 +17,8 @@ pub struct NetworkInfo {
 }
 pub(crate) async fn run_cmd_checked(program: &str, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x08000000);
     command.args(args).kill_on_drop(true);
     match tokio::time::timeout(Duration::from_secs(5), command.output()).await {
         Ok(Ok(out)) => {
@@ -35,6 +37,8 @@ pub(crate) async fn run_cmd_checked(program: &str, args: &[&str]) -> Result<Stri
 
 pub(crate) async fn output(program: &str, args: &[&str]) -> Option<String> {
     let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x08000000);
     command.args(args).kill_on_drop(true);
     match tokio::time::timeout(Duration::from_secs(4), command.output()).await {
         Ok(Ok(out)) if out.status.success() && out.stdout.len() < 262_144 => {
@@ -66,6 +70,17 @@ fn parse_nameservers(text: &str) -> Vec<String> {
             if ip_part.parse::<std::net::IpAddr>().is_ok() && !result.iter().any(|v| v == value) {
                 result.push(value.to_string());
             }
+        }
+    }
+    result
+}
+fn resolvectl_nameservers(text: &str) -> Vec<String> {
+    let mut result = vec![];
+    for token in text.split_whitespace() {
+        let ip = token.trim_matches(|c: char| c == ',' || c == ';');
+        let ip = ip.split('%').next().unwrap_or(ip);
+        if ip.parse::<std::net::IpAddr>().is_ok() && !result.iter().any(|v| v == ip) {
+            result.push(ip.to_string());
         }
     }
     result
@@ -365,6 +380,13 @@ pub async fn inspect() -> NetworkInfo {
                 output("resolvectl", &["dns"]),
                 output("resolvectl", &["domain"])
             );
+            if let Some(dns) = &dns {
+                for server in resolvectl_nameservers(dns) {
+                    if !dns_servers.iter().any(|existing| existing == &server) {
+                        dns_servers.push(server);
+                    }
+                }
+            }
             dns_configuration = match (dns_configuration, dns, domains) {
                 (Some(config), Some(dns), Some(domains)) => Some(format!(
                     "{config}\n{}\n{}",
@@ -449,9 +471,17 @@ pub async fn inspect() -> NetworkInfo {
             .unwrap_or("未读到显式代理；当前平台的 TUN 选路尚未核实")
     }
     .to_string();
-    checks.push(CheckResult::local("proxy-config", "代理与检测路径", if proxy_readable { "observed" } else { "unknown" }, proxy_summary.clone(),
-        "留空时检测仅使用系统路由，不自动采用应用代理；若已发现代理配置，外部探测会要求明确指定代理，避免绕过。")
-        .suggest("需要通过代理检测时，在设置填写现有代理地址，例如 http://127.0.0.1:7890。"));
+    checks.push(CheckResult::local(
+        "proxy-config",
+        "代理与检测路径",
+        if proxy_readable {
+            "observed"
+        } else {
+            "unknown"
+        },
+        proxy_summary.clone(),
+        "出口和 DNS 采样默认开启，沿当前系统路由出去。设置里保存了检测代理时，采样才改走那个地址。",
+    ));
     if !checks.iter().any(|c| c.id == "ipv6-policy") {
         checks.push(CheckResult::local(
             "ipv6-policy",
@@ -625,6 +655,22 @@ pub(crate) fn iana_to_windows_timezone(iana: &str) -> Result<&'static str, Strin
         "UTC" => "UTC",
         _ => return Err("此 IANA 时区尚无 Windows 映射，请填写 Windows 时区 ID".into()),
     })
+}
+
+/// Mainland China clock. Hong Kong, Macau, and Taipei are not mainland.
+/// Bare "CST" is ambiguous and is not treated as mainland.
+pub(crate) fn mainland_timezone(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "asia/shanghai"
+            | "asia/chongqing"
+            | "asia/chungking"
+            | "asia/harbin"
+            | "asia/beijing"
+            | "asia/urumqi"
+            | "prc"
+            | "china standard time"
+    )
 }
 
 pub(crate) fn timezone_matches(current: &str, target: &str) -> bool {
@@ -835,9 +881,178 @@ pub async fn restore_native_network(app_data_dir: &std::path::Path) -> Result<()
     }
 }
 
+pub fn existing_directory(raw: &str) -> Result<PathBuf, String> {
+    if raw.len() > 1024 || raw.chars().any(char::is_control) {
+        return Err("文件夹路径无效".into());
+    }
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err("请选择一个文件夹".into());
+    }
+    let path = path.canonicalize().map_err(|_| "找不到所选文件夹")?;
+    if !path.is_dir() {
+        return Err("请选择一个文件夹".into());
+    }
+    Ok(path)
+}
+
+pub async fn choose_directory() -> Result<Option<PathBuf>, String> {
+    let text = if cfg!(target_os = "macos") {
+        choose_directory_macos().await?
+    } else if cfg!(target_os = "linux") {
+        choose_directory_linux().await?
+    } else if cfg!(target_os = "windows") {
+        choose_directory_windows().await?
+    } else {
+        return Err("当前系统不能选择文件夹".into());
+    };
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    Ok(Some(existing_directory(&text)?))
+}
+
+pub fn open_directory(path: &Path) -> Result<(), String> {
+    let path = existing_directory(&path.to_string_lossy())?;
+    let program = if cfg!(target_os = "macos") {
+        "/usr/bin/open"
+    } else if cfg!(target_os = "windows") {
+        "explorer.exe"
+    } else if cfg!(target_os = "linux") {
+        "xdg-open"
+    } else {
+        return Err("当前系统不能打开文件夹".into());
+    };
+    std::process::Command::new(program)
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| "无法打开文件夹".to_string())?;
+    Ok(())
+}
+
+async fn choose_directory_macos() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let text = crate::firewall::command::run(
+            Path::new("/usr/bin/osascript"),
+            &[
+                "-e",
+                "try",
+                "-e",
+                "POSIX path of (choose folder with prompt \"选择保存日志的文件夹\")",
+                "-e",
+                "on error number -128",
+                "-e",
+                "return \"\"",
+                "-e",
+                "end try",
+            ],
+            None,
+        )
+        .await?;
+        let text = text.trim();
+        return Ok(if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前系统不能选择文件夹".into())
+    }
+}
+
+async fn choose_directory_linux() -> Result<Option<String>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        for (program, args) in [
+            (
+                "/usr/bin/zenity",
+                &[
+                    "--file-selection",
+                    "--directory",
+                    "--title=选择保存日志的文件夹",
+                ][..],
+            ),
+            ("/usr/bin/kdialog", &["--getexistingdirectory"][..]),
+        ] {
+            let path = Path::new(program);
+            if !path.is_file() {
+                continue;
+            }
+            match crate::firewall::command::run(path, args, None).await {
+                Ok(text) => {
+                    let text = text.trim();
+                    return Ok(if text.is_empty() {
+                        None
+                    } else {
+                        Some(text.to_string())
+                    });
+                }
+                Err(error) if error.contains("系统操作失败") => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        return Err("这个桌面没有文件夹选择器".into());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("当前系统不能选择文件夹".into())
+    }
+}
+
+async fn choose_directory_windows() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = "Add-Type -AssemblyName System.Windows.Forms | Out-Null; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = '选择保存日志的文件夹'; if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit 0 }; Write-Output $dialog.SelectedPath";
+        let text = crate::firewall::command::run(
+            &crate::firewall::windows::powershell()?,
+            &["-NoProfile", "-STA", "-Command", script],
+            None,
+        )
+        .await?;
+        let text = text.trim();
+        return Ok(if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("当前系统不能选择文件夹".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_directory_rejects_relative_paths_and_accepts_a_real_folder() {
+        assert!(existing_directory("relative").is_err());
+        assert!(existing_directory("/no/such/wujian-folder").is_err());
+        let dir = std::env::temp_dir();
+        let found = existing_directory(&dir.to_string_lossy()).unwrap();
+        assert!(found.is_dir());
+    }
+    #[test]
+    fn mainland_timezone_is_exact_and_skips_hong_kong_and_taiwan() {
+        assert!(mainland_timezone("Asia/Shanghai"));
+        assert!(mainland_timezone("Asia/Urumqi"));
+        assert!(mainland_timezone("Asia/Chongqing"));
+        assert!(mainland_timezone("PRC"));
+        assert!(mainland_timezone("China Standard Time"));
+        assert!(!mainland_timezone("America/Los_Angeles"));
+        assert!(!mainland_timezone("Asia/Hong_Kong"));
+        assert!(!mainland_timezone("Asia/Macau"));
+        assert!(!mainland_timezone("Asia/Taipei"));
+        assert!(!mainland_timezone("CST"));
+        assert!(!mainland_timezone("China Standard Time Extra"));
+    }
     #[test]
     fn validates_timezone_string_format() {
         assert!(validate_timezone_name("America/Los_Angeles").is_ok());
@@ -903,6 +1118,15 @@ mod tests {
                 "nameserver[0] : 127.0.0.1\nnameserver[1] : 2001:db8::1\nnameserver 127.0.0.1\n"
             ),
             vec!["127.0.0.1", "2001:db8::1"]
+        );
+    }
+    #[test]
+    fn resolvectl_nameservers_keep_link_addresses_and_skip_interface_names() {
+        assert_eq!(
+            resolvectl_nameservers(
+                "Global:\nLink 2 (enp0s1): 114.114.114.114 8.8.8.8\nLink 3 (wg0): 1.1.1.1 114.114.114.114\n"
+            ),
+            vec!["114.114.114.114", "8.8.8.8", "1.1.1.1"]
         );
     }
     #[test]

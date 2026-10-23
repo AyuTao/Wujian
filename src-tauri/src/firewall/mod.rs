@@ -35,6 +35,9 @@ pub struct Receipt {
     pub generation: Option<String>,
     pub checked_at: String,
     pub detail: String,
+    /// Set when auto-arm replaced the selected line. Absent on older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switched_node: Option<String>,
 }
 impl Receipt {
     pub(crate) fn new(active: bool, generation: Option<String>, detail: &str) -> Self {
@@ -48,6 +51,7 @@ impl Receipt {
             generation,
             checked_at: chrono::Utc::now().to_rfc3339(),
             detail: detail.into(),
+            switched_node: None,
         }
     }
 }
@@ -73,7 +77,7 @@ impl Request {
         {
             return Err("诊断操作 ID 无效".into());
         }
-        if self.action == "guard-plan" {
+        if self.action == "guard-plan" || self.action == "guard-switch" {
             let supported = cfg!(any(
                 target_os = "macos",
                 target_os = "linux",
@@ -93,7 +97,7 @@ impl Request {
             return Err("此操作不能指定代理用户".into());
         }
         match self.action.as_str() {
-            "network-apply" if self.policy.is_none() => {
+            "network-apply" | "network-apply-keep" if self.policy.is_none() => {
                 self.dns.as_ref().ok_or("缺少 DNS 设置")?.validate()
             }
             "network-release" if self.policy.is_none() && self.dns.is_none() => Ok(()),
@@ -390,8 +394,13 @@ async fn execute_request(request: &Request) -> Result<Receipt, String> {
         receipt.diagnostic_logs = Some(crate::audit::bundle());
         return Ok(receipt);
     }
-    if request.action == "guard-plan" {
-        let policy = tunnel::prepare(request.guard_user.ok_or("缺少代理用户")?).await?;
+    if request.action == "guard-plan" || request.action == "guard-switch" {
+        let uid = request.guard_user.ok_or("缺少代理用户")?;
+        let (policy, switched) = if request.action == "guard-switch" {
+            tunnel::prepare_switching(uid).await?
+        } else {
+            (tunnel::prepare(uid).await?, None)
+        };
         if cfg!(target_os = "macos") {
             macos::check_plan(&policy).await?;
         } else if cfg!(target_os = "linux") {
@@ -407,6 +416,7 @@ async fn execute_request(request: &Request) -> Result<Receipt, String> {
             "已核对全局模式、节点国家和 DNS 路径；尚未修改防火墙。",
         );
         receipt.guard_policy = Some(policy);
+        receipt.switched_node = switched;
         return Ok(receipt);
     }
     let dir = state_directory().await?;
@@ -517,7 +527,8 @@ pub async fn execute(request: &Request) -> Result<Receipt, String> {
     let _ = initialize_diagnostics("firewall_helper").await;
     let operation = match request.action.as_str() {
         "guard-plan" => "helper.guard.prepare",
-        "network-apply" => "helper.dns.apply",
+        "guard-switch" => "helper.guard.switch",
+        "network-apply" | "network-apply-keep" => "helper.dns.apply",
         "network-release" => "helper.dns.restore",
         "apply" => "helper.firewall.apply",
         "release" => "helper.firewall.release",
@@ -629,13 +640,22 @@ pub async fn diagnostic_bundle(app_data: &Path) -> Result<crate::audit::Bundle, 
         .ok_or("管理组件没有返回诊断日志".into())
 }
 pub async fn elevated(request: Request, app_data: &Path) -> Result<Receipt, String> {
+    elevated_prompt(request, app_data, true).await
+}
+
+pub async fn elevated_prompt(
+    request: Request,
+    app_data: &Path,
+    allow_prompt: bool,
+) -> Result<Receipt, String> {
     request.validate()?;
     #[cfg(target_os = "macos")]
     {
-        return crate::admin_helper::firewall(request, app_data).await;
+        return crate::admin_helper::firewall(request, app_data, allow_prompt).await;
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = allow_prompt;
         let dir = app_data
             .join("firewall-requests")
             .join(uuid::Uuid::new_v4().simple().to_string());
@@ -742,6 +762,28 @@ mod tests {
             guard_user: None,
             dns: None,
             action: "release; rm -rf".into(),
+            policy: None,
+            acknowledge_connection_reset: false
+        }
+        .validate()
+        .is_err());
+        assert!(Request {
+            operation_id: None,
+            guard_user: None,
+            dns: Some(crate::network_dns::Change {
+                servers: crate::network_dns::overseas_system_dns(),
+            }),
+            action: "network-apply-keep".into(),
+            policy: None,
+            acknowledge_connection_reset: false
+        }
+        .validate()
+        .is_ok());
+        assert!(Request {
+            operation_id: None,
+            guard_user: None,
+            dns: None,
+            action: "network-apply-keep".into(),
             policy: None,
             acknowledge_connection_reset: false
         }
