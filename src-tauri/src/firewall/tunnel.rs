@@ -1354,6 +1354,7 @@ mod tests {
             Some(false)
         );
     }
+    #[cfg(unix)]
     #[test]
     fn directory_service_home_is_the_matching_user_only() {
         let text = "name: ayu\nuid: 501\ndir: /Users/ayu\n\nname: root\nuid: 0\ndir: /var/root\n";
@@ -1483,8 +1484,11 @@ mod tests {
         );
         assert!(linux_link_up(r#"[{"flags":["POINTOPOINT","UP"]}]"#));
         assert!(!linux_link_up(r#"[{"flags":["UP"]}]"#));
-        assert!(home_from_passwd("ayu:x:1000:1000:Ayu:/home/ayu:/bin/zsh", 1000).is_ok());
-        assert!(home_from_passwd("root:x:0:0:root:/root:/bin/zsh", 1000).is_err());
+        #[cfg(unix)]
+        {
+            assert!(home_from_passwd("ayu:x:1000:1000:Ayu:/home/ayu:/bin/zsh", 1000).is_ok());
+            assert!(home_from_passwd("root:x:0:0:root:/root:/bin/zsh", 1000).is_err());
+        }
         assert!(validate_home(r"C:\Windows\system32\config\systemprofile").is_err());
     }
 }

@@ -353,13 +353,21 @@ mod tests {
         let parent = "anchor \"200.AirDrop/*\"\nanchor \"250.ApplicationFirewall/*\"\n";
         assert!(reachable(stock, parent, "").is_ok());
         assert!(reachable("pass quick all\nanchor \"com.apple/*\"\n", parent, "").is_err());
+        #[cfg(target_os = "macos")]
         assert!(validate_stock_anchor_point().is_ok());
-        let dir = std::env::temp_dir().join(format!("wujian-pf-{}", uuid::Uuid::new_v4().simple()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pf.conf");
-        fs::write(&path, stock).unwrap();
-        assert!(read_system_file(path.to_str().unwrap()).is_err());
-        let _ = fs::remove_dir_all(dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir =
+                std::env::temp_dir().join(format!("wujian-pf-{}", uuid::Uuid::new_v4().simple()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("pf.conf");
+            fs::write(&path, stock).unwrap();
+            // Check the ownership/permissions contract without assuming a non-root runner.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(read_system_file(path.to_str().unwrap()).is_err());
+            let _ = fs::remove_dir_all(dir);
+        }
     }
     #[test]
     fn disconnected_anchor_or_earlier_bypass_is_rejected() {

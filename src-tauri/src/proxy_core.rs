@@ -119,7 +119,7 @@ mod tests {
         );
         let text = paths
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| path.display().to_string().replace('\\', "/"))
             .collect::<Vec<_>>()
             .join("\n");
         for expected in [
