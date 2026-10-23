@@ -22,9 +22,13 @@ pub const LOCAL4: &[&str] = &[
     "223.5.5.5/32",
 ];
 pub const LOCAL6: &[&str] = &["::1/128", "fc00::/7", "fe80::/10", "ff02::/16"];
+/// Private LAN only. Not CGNAT, fake-ip, or link-local.
+pub const LAN4: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Policy {
+    #[serde(default)]
+    pub tunnel_guard: Option<super::tunnel::TunnelGuard>,
     #[serde(default)]
     pub lockdown: bool,
     #[serde(default)]
@@ -38,6 +42,7 @@ pub struct Policy {
 impl Policy {
     pub fn isolation() -> Self {
         Self {
+            tunnel_guard: None,
             ipv6_only: false,
             lockdown: true,
             version: 1,
@@ -48,6 +53,7 @@ impl Policy {
     }
     pub fn ipv6_block() -> Self {
         Self {
+            tunnel_guard: None,
             lockdown: false,
             ipv6_only: true,
             version: 1,
@@ -60,6 +66,7 @@ impl Policy {
         let networks = crate::geo::CountryDb::open(path)?.china_networks()?;
         let cn_networks = networks.into_iter().filter(|v| !v.contains(':')).collect();
         let result = Self {
+            tunnel_guard: None,
             lockdown: false,
             ipv6_only: false,
             version: 1,
@@ -76,6 +83,16 @@ impl Policy {
             || !self.generation.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err("规则版本或代次无效".into());
+        }
+        if let Some(guard) = &self.tunnel_guard {
+            if self.lockdown
+                || self.ipv6_only
+                || !self.cn_networks.is_empty()
+                || !self.extra_allowed.is_empty()
+            {
+                return Err("全局隧道保护不能包含国内或额外直连白名单".into());
+            }
+            return guard.validate();
         }
         if self.lockdown || self.ipv6_only {
             if self.lockdown && self.ipv6_only {
@@ -105,11 +122,16 @@ impl Policy {
         Ok(())
     }
     pub fn allowed4(&self) -> Vec<Cidr> {
+        if self.tunnel_guard.is_some() {
+            return vec![Cidr::parse("127.0.0.0/8").unwrap()];
+        }
         if self.ipv6_only {
             return vec![Cidr::parse("0.0.0.0/0").unwrap()];
         }
         if self.lockdown {
-            return vec![Cidr::parse("127.0.0.0/8").unwrap()];
+            let mut allow = vec![Cidr::parse("127.0.0.0/8").unwrap()];
+            allow.extend(LAN4.iter().map(|cidr| Cidr::parse(cidr).unwrap()));
+            return allow;
         }
         self.cn_networks
             .iter()
@@ -120,7 +142,7 @@ impl Policy {
             .collect()
     }
     pub fn allowed6(&self) -> Vec<Cidr> {
-        if self.lockdown || self.ipv6_only {
+        if self.lockdown || self.ipv6_only || self.tunnel_guard.is_some() {
             return vec![Cidr::parse("::1/128").unwrap()];
         }
         LOCAL6
@@ -139,6 +161,7 @@ mod tests {
     use super::*;
     pub fn fixture() -> Policy {
         Policy {
+            tunnel_guard: None,
             lockdown: false,
             ipv6_only: false,
             version: 1,
@@ -182,7 +205,7 @@ mod tests {
         assert!(p.validate().is_err());
     }
     #[test]
-    fn isolation_has_no_dns_or_lan_bypass_and_ipv6_mode_keeps_ipv4() {
+    fn isolation_blocks_public_addresses_and_keeps_private_lan() {
         let isolation = Policy::isolation();
         isolation.validate().unwrap();
         let blocked = isolation.denied();
@@ -190,13 +213,14 @@ mod tests {
             "1.1.1.1",
             "8.8.8.8",
             "223.5.5.5",
-            "192.168.1.1",
+            "100.64.0.1",
+            "198.18.0.1",
             "fd00::1",
             "2001:db8::1",
         ] {
             assert!(blocked.iter().any(|n| n.contains(value.parse().unwrap())));
         }
-        for value in ["127.0.0.1", "::1"] {
+        for value in ["127.0.0.1", "::1", "192.168.10.8", "10.1.2.3", "172.16.0.9"] {
             assert!(!blocked.iter().any(|n| n.contains(value.parse().unwrap())));
         }
         let ipv6 = Policy::ipv6_block();

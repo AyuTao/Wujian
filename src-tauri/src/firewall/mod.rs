@@ -6,6 +6,8 @@ mod linux;
 mod macos;
 pub mod policy;
 pub mod render;
+pub mod tunnel;
+mod watchdog;
 mod windows;
 use policy::Policy;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,12 @@ pub(crate) use windows::powershell as system_powershell;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Receipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_logs: Option<crate::audit::Bundle>,
+    #[serde(default)]
+    pub policy_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_policy: Option<Policy>,
     pub backend: String,
     pub configuration_active: bool,
     pub enforcement_verified: bool,
@@ -31,6 +39,9 @@ pub struct Receipt {
 impl Receipt {
     pub(crate) fn new(active: bool, generation: Option<String>, detail: &str) -> Self {
         Self {
+            diagnostic_logs: None,
+            policy_mode: "unknown".into(),
+            guard_policy: None,
             backend: backend().into(),
             configuration_active: active,
             enforcement_verified: false,
@@ -43,6 +54,10 @@ impl Receipt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub guard_user: Option<u32>,
     #[serde(default)]
     pub dns: Option<crate::network_dns::Change>,
     pub action: String,
@@ -51,13 +66,41 @@ pub struct Request {
 }
 impl Request {
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .operation_id
+            .as_ref()
+            .is_some_and(|s| uuid::Uuid::parse_str(s).is_err())
+        {
+            return Err("诊断操作 ID 无效".into());
+        }
+        if self.action == "guard-plan" {
+            let supported = cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            ));
+            return if supported
+                && self.guard_user.is_some_and(|uid| uid > 0)
+                && self.policy.is_none()
+                && self.dns.is_none()
+            {
+                Ok(())
+            } else {
+                Err("全局 TUN 计划需要桌面用户".into())
+            };
+        }
+        if self.guard_user.is_some() {
+            return Err("此操作不能指定代理用户".into());
+        }
         match self.action.as_str() {
             "network-apply" if self.policy.is_none() => {
                 self.dns.as_ref().ok_or("缺少 DNS 设置")?.validate()
             }
             "network-release" if self.policy.is_none() && self.dns.is_none() => Ok(()),
             "apply" if self.dns.is_none() => self.policy.as_ref().ok_or("缺少规则策略")?.validate(),
-            "release" | "status" if self.policy.is_none() && self.dns.is_none() => Ok(()),
+            "release" | "status" | "diagnostics" if self.policy.is_none() && self.dns.is_none() => {
+                Ok(())
+            }
             _ => Err("不支持的隔断操作".into()),
         }
     }
@@ -66,6 +109,9 @@ impl Request {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManagedState {
     policy: Policy,
+    /// Tunnel plan kept while the network is cut, so the same node can resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<Policy>,
     pf_token: Option<String>,
     fingerprint: Option<u64>,
 }
@@ -183,6 +229,8 @@ pub fn export_plan(policy: &Policy, dir: &Path) -> Result<(), String> {
     }
     for action in ["apply", "release", "status"] {
         let request = Request {
+            operation_id: None,
+            guard_user: None,
             dns: None,
             action: action.into(),
             policy: if action == "apply" {
@@ -242,6 +290,9 @@ fn load_state(dir: &Path) -> Result<Option<ManagedState>, String> {
     }
     let state: ManagedState = read_json(&path, 8 * 1024 * 1024)?;
     state.policy.validate()?;
+    if let Some(plan) = &state.resume {
+        plan.validate()?;
+    }
     Ok(Some(state))
 }
 fn fingerprint(value: &Value) -> u64 {
@@ -332,6 +383,32 @@ async fn state_directory() -> Result<PathBuf, String> {
 async fn execute_request(request: &Request) -> Result<Receipt, String> {
     request.validate()?;
     require_administrator().await?;
+    let diagnostic_dir = state_directory().await?;
+    let _ = crate::audit::init_source(&diagnostic_dir, "firewall_helper");
+    if request.action == "diagnostics" {
+        let mut receipt = Receipt::new(false, None, "系统保护诊断日志；不是规则状态证明。");
+        receipt.diagnostic_logs = Some(crate::audit::bundle());
+        return Ok(receipt);
+    }
+    if request.action == "guard-plan" {
+        let policy = tunnel::prepare(request.guard_user.ok_or("缺少代理用户")?).await?;
+        if cfg!(target_os = "macos") {
+            macos::check_plan(&policy).await?;
+        } else if cfg!(target_os = "linux") {
+            linux::check_plan(&policy).await?;
+        } else if cfg!(target_os = "windows") {
+            windows::check_plan(&policy)?;
+        } else {
+            return Err("当前系统暂不支持全局 TUN 保护".into());
+        }
+        let mut receipt = Receipt::new(
+            false,
+            Some(policy.generation.clone()),
+            "已核对全局模式、节点国家和 DNS 路径；尚未修改防火墙。",
+        );
+        receipt.guard_policy = Some(policy);
+        return Ok(receipt);
+    }
     let dir = state_directory().await?;
     let operation_lock = std::fs::OpenOptions::new()
         .read(true)
@@ -355,12 +432,23 @@ async fn execute_request(request: &Request) -> Result<Receipt, String> {
     };
     match request.action.as_str() {
         "apply" => {
+            if let Some(guard) = request
+                .policy
+                .as_ref()
+                .and_then(|p| p.tunnel_guard.as_ref())
+            {
+                tunnel::verify(guard).await?;
+            }
             let mut state = ManagedState {
                 policy: request.policy.clone().ok_or("规则缺失")?,
+                resume: None,
                 pf_token: state.and_then(|s| s.pf_token),
                 fingerprint: None,
             };
             save_state(&dir, &state)?;
+            if state.policy.tunnel_guard.is_some() {
+                watchdog::install(&dir).await?;
+            }
             let result = if cfg!(target_os = "macos") {
                 macos::apply(&mut state, &dir, request.acknowledge_connection_reset).await
             } else if cfg!(target_os = "linux") {
@@ -370,11 +458,16 @@ async fn execute_request(request: &Request) -> Result<Receipt, String> {
             } else {
                 Err("不支持的平台".into())
             };
-            result.map_err(|error| {
+            let receipt = result.map_err(|error| {
                 format!("{error}。操作失败不代表规则已解除，可使用本机的解除隔断。")
-            })
+            })?;
+            if state.policy.tunnel_guard.is_some() {
+                watchdog::publish(receipt.clone())?;
+            }
+            Ok(receipt)
         }
         "release" => {
+            watchdog::remove().await?;
             let result = if cfg!(target_os = "macos") {
                 macos::release(state.as_ref()).await
             } else if cfg!(target_os = "linux") {
@@ -387,6 +480,7 @@ async fn execute_request(request: &Request) -> Result<Receipt, String> {
                 std::fs::remove_file(path)
                     .map_err(|_| "规则已清除，但本地状态文件未删除；请重新核验")?;
             }
+            watchdog::clear_status();
             Ok(result)
         }
         "status" => {
@@ -401,11 +495,59 @@ async fn execute_request(request: &Request) -> Result<Receipt, String> {
         _ => Err("无效操作".into()),
     }
 }
+pub async fn initialize_diagnostics(source: &str) -> Result<(), String> {
+    require_administrator().await?;
+    let dir = state_directory().await?;
+    crate::audit::init_source(&dir, source)?;
+    crate::audit::install_panic_hook();
+    Ok(())
+}
+pub async fn watchdog() -> Result<(), String> {
+    require_administrator().await?;
+    let dir = state_directory().await?;
+    let _ = crate::audit::init_source(&dir, "watchdog");
+    crate::audit::install_panic_hook();
+    crate::audit::record_async("watchdog.run", watchdog::run(dir)).await
+}
+pub async fn execute(request: &Request) -> Result<Receipt, String> {
+    // Only this process writes to its administrator-owned directory.
+    if request.action == "diagnostics" {
+        return execute_request(request).await;
+    }
+    let _ = initialize_diagnostics("firewall_helper").await;
+    let operation = match request.action.as_str() {
+        "guard-plan" => "helper.guard.prepare",
+        "network-apply" => "helper.dns.apply",
+        "network-release" => "helper.dns.restore",
+        "apply" => "helper.firewall.apply",
+        "release" => "helper.firewall.release",
+        _ => "helper.firewall.verify",
+    };
+    let mut span = crate::audit::Span::with_id(operation, request.operation_id.as_deref());
+    let result = execute_request(request).await;
+    span.finish(&result);
+    result
+}
+pub async fn emergency_release() -> Result<Receipt, String> {
+    execute(&Request {
+        operation_id: None,
+        guard_user: None,
+        dns: None,
+        action: "release".into(),
+        policy: None,
+        acknowledge_connection_reset: true,
+    })
+    .await
+}
+/// Read-only status from the root helper. Saved UI state is never live evidence.
+pub fn guard_status() -> Result<Receipt, String> {
+    watchdog::read_status()
+}
 /// Called only by the native executable's explicit helper entry point.
 /// It never starts the UI as administrator.
 pub async fn helper(request_path: &Path, result_file: bool) -> Result<(), String> {
     let request: Request = read_json(request_path, 4 * 1024 * 1024)?;
-    let response = match execute_request(&request).await {
+    let response = match execute(&request).await {
         Ok(receipt) => Response {
             receipt: Some(receipt),
             error: None,
@@ -438,20 +580,12 @@ pub async fn helper(request_path: &Path, result_file: bool) -> Result<(), String
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-fn applescript_quote(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-    )
-}
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
-fn windows_argument(value: &str) -> String {
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn windows_argument(value: &str) -> String {
     let mut result = String::from("\"");
     let mut slashes = 0;
     for ch in value.chars() {
@@ -472,74 +606,120 @@ fn windows_argument(value: &str) -> String {
     result.push('"');
     result
 }
-/// Interactive OS authorization is triggered only by the user's explicit action.
+/// macOS asks for an administrator password once, while installing the resident helper.
+/// Later requests use that helper. Other platforms still authorize each operation.
 /// The request contains typed policy data, never arbitrary executable commands.
+pub async fn diagnostic_bundle(app_data: &Path) -> Result<crate::audit::Bundle, String> {
+    let request = Request {
+        operation_id: None,
+        guard_user: None,
+        dns: None,
+        action: "diagnostics".into(),
+        policy: None,
+        acknowledge_connection_reset: false,
+    };
+    #[cfg(target_os = "macos")]
+    let receipt = crate::admin_helper::diagnostics(request).await?;
+    #[cfg(not(target_os = "macos"))]
+    let receipt = elevated(request, app_data).await?;
+    #[cfg(target_os = "macos")]
+    let _ = app_data;
+    receipt
+        .diagnostic_logs
+        .ok_or("管理组件没有返回诊断日志".into())
+}
 pub async fn elevated(request: Request, app_data: &Path) -> Result<Receipt, String> {
     request.validate()?;
-    let dir = app_data
-        .join("firewall-requests")
-        .join(uuid::Uuid::new_v4().simple().to_string());
-    std::fs::create_dir_all(&dir).map_err(|_| "无法准备管理员请求目录")?;
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| "无法保护请求目录")?;
+        return crate::admin_helper::firewall(request, app_data).await;
     }
-    let path = dir.join("request.json");
-    write_private(
-        &path,
-        &serde_json::to_vec(&request).map_err(|_| "请求序列化失败")?,
-    )?;
-    let exe = std::env::current_exe().map_err(|_| "无法定位原生程序")?;
-    let exe = exe.to_str().ok_or("程序路径编码无效")?;
-    let request_path = path.to_str().ok_or("请求路径编码无效")?;
-    let output = if cfg!(target_os = "macos") {
-        let command = format!(
-            "{} --firewall-helper {}",
-            shell_quote(exe),
-            shell_quote(request_path)
-        );
-        let script = format!(
-            "do shell script {} with administrator privileges",
-            applescript_quote(&command)
-        );
-        command::run(Path::new("/usr/bin/osascript"), &["-e", &script], None).await?
-    } else if cfg!(target_os = "linux") {
-        let pkexec = ["/usr/bin/pkexec", "/bin/pkexec"]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|p| p.is_file())
-            .ok_or("需要安装 polkit/pkexec 才能在桌面授权；也可使用 sudo 运行原生 helper 请求")?;
-        command::run(&pkexec, &[exe, "--firewall-helper", request_path], None).await?
-    } else if cfg!(target_os = "windows") {
-        let arguments = ["--firewall-helper", request_path, "--result-file"]
-            .map(windows_argument)
-            .join(" ");
-        let script=format!("$ErrorActionPreference='Stop'; $p=Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; if ($p.ExitCode -ne 0) {{ throw 'Administrator helper failed' }}",ps_quote(exe),ps_quote(&arguments));
-        command::run(
-            &windows::powershell()?,
-            &["-NoProfile", "-NonInteractive", "-Command", &script],
-            None,
-        )
-        .await?;
-        std::fs::read_to_string(dir.join("result.json")).map_err(|_| "未收到管理员操作回执")?
-    } else {
-        return Err("当前平台不支持管理员隔断操作".into());
-    };
-    let response: Response = serde_json::from_str(output.trim())
-        .map_err(|_| "管理员操作回执格式无效；请核验当前规则，不要假定已经解除")?;
-    if let Some(error) = response.error {
-        return Err(error);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dir = app_data
+            .join("firewall-requests")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&dir).map_err(|_| "无法准备管理员请求目录")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| "无法保护请求目录")?;
+        }
+        let path = dir.join("request.json");
+        write_private(
+            &path,
+            &serde_json::to_vec(&request).map_err(|_| "请求序列化失败")?,
+        )?;
+        let exe = std::env::current_exe().map_err(|_| "无法定位原生程序")?;
+        let exe = exe.to_str().ok_or("程序路径编码无效")?;
+        let request_path = path.to_str().ok_or("请求路径编码无效")?;
+        let output = if cfg!(target_os = "linux") {
+            let pkexec = ["/usr/bin/pkexec", "/bin/pkexec"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|p| p.is_file())
+                .ok_or(
+                    "需要安装 polkit/pkexec 才能在桌面授权；也可使用 sudo 运行原生 helper 请求",
+                )?;
+            command::run(&pkexec, &[exe, "--firewall-helper", request_path], None).await?
+        } else if cfg!(target_os = "windows") {
+            let arguments = ["--firewall-helper", request_path, "--result-file"]
+                .map(windows_argument)
+                .join(" ");
+            let script=format!("$ErrorActionPreference='Stop'; $p=Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; if ($p.ExitCode -ne 0) {{ throw 'Administrator helper failed' }}",ps_quote(exe),ps_quote(&arguments));
+            command::run(
+                &windows::powershell()?,
+                &["-NoProfile", "-NonInteractive", "-Command", &script],
+                None,
+            )
+            .await?;
+            std::fs::read_to_string(dir.join("result.json")).map_err(|_| "未收到管理员操作回执")?
+        } else {
+            return Err("当前平台不支持管理员隔断操作".into());
+        };
+        let response: Response = serde_json::from_str(output.trim())
+            .map_err(|_| "管理员操作回执格式无效；请核验当前规则，不要假定已经解除")?;
+        if let Some(error) = response.error {
+            return Err(error);
+        }
+        response.receipt.ok_or("管理员操作没有返回状态".into())
     }
-    response.receipt.ok_or("管理员操作没有返回状态".into())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn diagnostic_requests_are_read_only_and_operation_ids_are_not_free_text() {
+        let mut request = Request {
+            operation_id: None,
+            guard_user: None,
+            dns: None,
+            action: "diagnostics".into(),
+            policy: None,
+            acknowledge_connection_reset: false,
+        };
+        assert!(request.validate().is_ok());
+        assert!(serde_json::to_value(&request)
+            .unwrap()
+            .get("operationId")
+            .is_none());
+        request.operation_id = Some("token=secret /Users/private".into());
+        assert!(request.validate().is_err());
+        request.operation_id = Some(uuid::Uuid::new_v4().to_string());
+        request.policy = Some(Policy::isolation());
+        assert!(request.validate().is_err());
+        let old = r#"{"guardUser":null,"dns":null,"action":"status","policy":null,"acknowledgeConnectionReset":false}"#;
+        assert!(serde_json::from_str::<Request>(old)
+            .unwrap()
+            .validate()
+            .is_ok());
+    }
+    #[test]
     fn only_typed_actions_are_authorized() {
         assert!(Request {
+            operation_id: None,
+            guard_user: None,
             dns: None,
             action: "status".into(),
             policy: None,
@@ -548,6 +728,8 @@ mod tests {
         .validate()
         .is_ok());
         assert!(Request {
+            operation_id: None,
+            guard_user: None,
             dns: None,
             action: "apply".into(),
             policy: None,
@@ -556,6 +738,8 @@ mod tests {
         .validate()
         .is_err());
         assert!(Request {
+            operation_id: None,
+            guard_user: None,
             dns: None,
             action: "release; rm -rf".into(),
             policy: None,
@@ -563,6 +747,22 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+    #[test]
+    fn guard_plan_requires_a_desktop_user_on_every_supported_system() {
+        let mut request = Request {
+            operation_id: None,
+            guard_user: Some(501),
+            dns: None,
+            action: "guard-plan".into(),
+            policy: None,
+            acknowledge_connection_reset: false,
+        };
+        assert!(request.validate().is_ok());
+        request.guard_user = Some(0);
+        assert!(request.validate().is_err());
+        request.guard_user = None;
+        assert!(request.validate().is_err());
     }
     #[test]
     fn counter_changes_do_not_mask_changed_addresses() {

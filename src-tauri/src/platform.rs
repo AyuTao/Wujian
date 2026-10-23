@@ -70,6 +70,40 @@ fn parse_nameservers(text: &str) -> Vec<String> {
     }
     result
 }
+// Keep resolver scopes and options, excluding transient reachability/counter fields.
+fn normalized_dns(text: &str) -> String {
+    let mut blocks = vec![];
+    let mut block = vec![];
+    for line in text.lines().map(str::trim) {
+        if line.starts_with("resolver #") || line.starts_with("DNS configuration") {
+            if !block.is_empty() {
+                blocks.push(block.join("\n"));
+                block.clear();
+            }
+        } else if !line.is_empty() && !line.starts_with('#') && !line.starts_with("reach ") {
+            block.push(line);
+        }
+    }
+    if !block.is_empty() {
+        blocks.push(block.join("\n"));
+    }
+    blocks.sort();
+    blocks.join("\n--\n")
+}
+fn dns_policy_check(servers: &[String], configuration: Option<&str>) -> CheckResult {
+    let value = configuration
+        .filter(|s| !s.is_empty())
+        .filter(|_| !servers.is_empty());
+    let fingerprint = value.map(|s| {
+        let mut hash = DefaultHasher::new();
+        s.hash(&mut hash);
+        format!("{:016x}", hash.finish())
+    });
+    CheckResult::local("dns-policy", "DNS 配置基线", if fingerprint.is_some() { "observed" } else { "unknown" },
+        fingerprint.unwrap_or_else(|| "未完整读取解析配置".into()),
+        "只锁定可读取的系统解析器、作用域及解析文件，不代表代理内部上游或应用自有 DoH 已核验；不会修改 DNS。")
+}
+
 fn home() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
@@ -224,6 +258,7 @@ fn evidence_fingerprint(signature: &str, checks: &[CheckResult]) -> u64 {
     // Observation times and command timing are not network configuration.
     let mut evidence: Vec<_> = checks
         .iter()
+        .filter(|c| c.id != "proxy-mode")
         .map(|c| (&c.id, &c.status, &c.value))
         .collect();
     evidence.sort_unstable();
@@ -246,6 +281,7 @@ pub async fn inspect() -> NetworkInfo {
     .any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()));
     let mut dns_servers = vec![];
     let mut signature = String::new();
+    let mut dns_configuration = None;
     let mut app_proxy_present = env_proxy;
     let mut proxy_readable = true;
     let mut checks = vec![];
@@ -262,6 +298,7 @@ pub async fn inspect() -> NetworkInfo {
         if let Some(text) = dns {
             dns_servers = parse_nameservers(&text);
             signature.push_str(&dns_servers.join(","));
+            dns_configuration = Some(normalized_dns(&text));
         }
         if let Some(text) = proxy {
             app_proxy_present |= text.lines().any(|line| {
@@ -285,14 +322,35 @@ pub async fn inspect() -> NetworkInfo {
         } else {
             proxy_readable = false;
         }
-        let count = std::fs::read_dir("/etc/resolver")
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.path().is_file())
-                    .count()
-            })
-            .unwrap_or(0);
+        let mut resolver_files = vec![];
+        let mut scoped_ok = true;
+        match std::fs::read_dir("/etc/resolver") {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) if entry.path().is_file() => match std::fs::read(entry.path()) {
+                            Ok(bytes) if bytes.len() <= 262_144 => resolver_files.push((
+                                entry.file_name(),
+                                normalized_dns(&String::from_utf8_lossy(&bytes)),
+                            )),
+                            _ => scoped_ok = false,
+                        },
+                        Ok(_) => {}
+                        Err(_) => scoped_ok = false,
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => scoped_ok = false,
+        }
+        resolver_files.sort();
+        let count = resolver_files.len();
+        if let Some(config) = dns_configuration.as_mut() {
+            config.push_str(&format!("{resolver_files:?}"));
+        }
+        if !scoped_ok {
+            dns_configuration = None;
+        }
         checks.push(CheckResult::local("scoped-dns", "按域名解析设置", if count > 0 { "observed" } else { "not_applicable" },
             if count > 0 { format!("发现 {count} 个域名解析文件") } else { "未发现额外的解析文件".into() },
             "文件存在只说明配置存在，不能证明本地 DNS 服务可用，也不能替代缓存、DoH 或已有连接验证。"));
@@ -300,6 +358,21 @@ pub async fn inspect() -> NetworkInfo {
         if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
             dns_servers = parse_nameservers(&text);
             signature.push_str(&text);
+            dns_configuration = Some(normalized_dns(&text));
+        }
+        if Path::new("/run/systemd/resolve").exists() {
+            let (dns, domains) = tokio::join!(
+                output("resolvectl", &["dns"]),
+                output("resolvectl", &["domain"])
+            );
+            dns_configuration = match (dns_configuration, dns, domains) {
+                (Some(config), Some(dns), Some(domains)) => Some(format!(
+                    "{config}\n{}\n{}",
+                    normalized_dns(&dns),
+                    normalized_dns(&domains)
+                )),
+                _ => None,
+            };
         }
         if let Some(route) = output("ip", &["route", "show"]).await {
             signature.push_str(&route);
@@ -311,14 +384,23 @@ pub async fn inspect() -> NetworkInfo {
         }
         checks.push(CheckResult::local("resolver-scope", "解析管理器", "review", "读取 resolv.conf；作用域需核查", "systemd-resolved、NetworkManager 和应用自有解析可能使用其他路径；此版本不将文件内容视为全系统解析证明。"));
     } else if cfg!(windows) {
-        let dns = output("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "Get-DnsClientServerAddress | ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique"]).await;
+        let dns = output("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "Get-DnsClientServerAddress | Sort-Object InterfaceIndex,AddressFamily | Select-Object InterfaceIndex,AddressFamily,ServerAddresses | ConvertTo-Json -Depth 4 -Compress"]).await;
         if let Some(text) = dns {
-            dns_servers = text
-                .lines()
-                .map(str::trim)
-                .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
-                .map(str::to_owned)
-                .collect();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let rows = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+                for row in rows {
+                    if let Some(servers) = row["ServerAddresses"].as_array() {
+                        for server in servers.iter().filter_map(|v| v.as_str()) {
+                            if server.parse::<std::net::IpAddr>().is_ok() {
+                                dns_servers.push(server.to_owned());
+                            }
+                        }
+                    }
+                }
+                dns_servers.sort();
+                dns_servers.dedup();
+                dns_configuration = Some(text.clone());
+            }
             signature.push_str(&text);
         }
         if let Some(text) = output("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "$p=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'; $p | Select-Object ProxyEnable,ProxyServer,AutoConfigURL | ConvertTo-Json -Compress"]).await {
@@ -341,6 +423,21 @@ pub async fn inspect() -> NetworkInfo {
         checks.extend(other);
         signature.push_str(&info);
     }
+    let dns_policy = dns_policy_check(&dns_servers, dns_configuration.as_deref());
+    signature.push_str(&dns_policy.value);
+    checks.push(dns_policy);
+    let timezone = get_system_timezone();
+    checks.push(CheckResult::local(
+        "timezone",
+        "系统时区",
+        if timezone.is_ok() {
+            "observed"
+        } else {
+            "unknown"
+        },
+        timezone.unwrap_or_else(|_| "未能读取系统时区".into()),
+        "时区由用户指定或在开启守护时锁定；不根据出口国家推断。",
+    ));
     checks.insert(0, crate::network::dns_check(&dns_servers));
     let proxy_summary = if !proxy_readable {
         "部分代理设置无法读取"
@@ -384,9 +481,11 @@ pub async fn inspect() -> NetworkInfo {
     let route_tun_ok = checks
         .iter()
         .any(|c| c.id == "network-route" && c.status == "match");
+    let home = home();
+    let installed =
+        crate::proxy_core::clash_verge_present(home.as_deref().unwrap_or(std::path::Path::new("")));
+    checks.push(crate::proxy_core::install_check(installed));
     let mode = crate::proxy_core::inspect(route_tun_ok).await;
-    signature.push_str(&mode.value);
-    signature.push_str(&mode.status);
     checks.push(mode);
     let fingerprint = evidence_fingerprint(&signature, &checks);
     NetworkInfo {
@@ -495,10 +594,9 @@ pub fn get_system_timezone() -> Result<String, String> {
         }
     }
 
-    Ok("Asia/Shanghai".to_string())
+    Err("未能读取系统时区".into())
 }
 
-#[cfg(test)]
 pub fn validate_timezone_name(tz: &str) -> Result<(), String> {
     if tz.is_empty()
         || tz.len() > 64
@@ -509,6 +607,118 @@ pub fn validate_timezone_name(tz: &str) -> Result<(), String> {
         return Err("时区标识符格式无效".into());
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn iana_to_windows_timezone(iana: &str) -> Result<&'static str, String> {
+    Ok(match iana {
+        "America/Los_Angeles" => "Pacific Standard Time",
+        "America/Denver" => "Mountain Standard Time",
+        "America/Chicago" => "Central Standard Time",
+        "America/New_York" => "Eastern Standard Time",
+        "Asia/Shanghai" => "China Standard Time",
+        "Asia/Tokyo" => "Tokyo Standard Time",
+        "Asia/Singapore" => "Singapore Standard Time",
+        "Asia/Hong_Kong" => "China Standard Time",
+        "Europe/London" => "GMT Standard Time",
+        "Europe/Berlin" => "W. Europe Standard Time",
+        "UTC" => "UTC",
+        _ => return Err("此 IANA 时区尚无 Windows 映射，请填写 Windows 时区 ID".into()),
+    })
+}
+
+pub(crate) fn timezone_matches(current: &str, target: &str) -> bool {
+    if current == target {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    if target.contains('/') {
+        return iana_to_windows_timezone(target).is_ok_and(|expected| current == expected);
+    }
+    false
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub async fn set_system_timezone(target_tz: &str) -> Result<(), String> {
+    validate_timezone_name(target_tz)?;
+    if get_system_timezone().is_ok_and(|current| timezone_matches(&current, target_tz)) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = tokio::process::Command::new("/usr/sbin/systemsetup");
+        cmd.args(["-settimezone", target_tz]).kill_on_drop(true);
+        if let Ok(out) = cmd.output().await {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success()
+                && !stderr.contains("requires an administrator password")
+                && !stderr.contains("You need administrator access")
+            {
+                if let Ok(verified) = get_system_timezone() {
+                    if verified == target_tz {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let script = format!(
+            "do shell script \"/usr/sbin/systemsetup -settimezone {}\" with administrator privileges",
+            shell_quote(target_tz)
+        );
+        let mut oscmd = tokio::process::Command::new("/usr/bin/osascript");
+        oscmd.args(["-e", &script]).kill_on_drop(true);
+        let out = oscmd
+            .output()
+            .await
+            .map_err(|e| format!("执行时区设置失败: {e}"))?;
+        if out.status.success() {
+            if let Ok(verified) = get_system_timezone() {
+                if verified == target_tz {
+                    return Ok(());
+                }
+            }
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(format!("修改系统时区未授权或失败: {}", err.trim()))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let win_tz = if target_tz.contains('/') {
+            iana_to_windows_timezone(target_tz)?
+        } else {
+            target_tz
+        };
+        let mut cmd = tokio::process::Command::new("tzutil");
+        cmd.args(["/s", win_tz]).kill_on_drop(true);
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| format!("执行时区设置失败: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        return Err("修改 Windows 时区失败".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = tokio::process::Command::new("pkexec");
+        cmd.args(["timedatectl", "set-timezone", target_tz])
+            .kill_on_drop(true);
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| format!("执行时区设置失败: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        return Err("修改 Linux 时区失败".into());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    Err("不支持的时区修改平台".into())
 }
 
 #[allow(dead_code)]
@@ -604,7 +814,7 @@ pub async fn restore_native_network(app_data_dir: &std::path::Path) -> Result<()
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(temp);
-                    errors.push(format!("恢复 Clash 文件失败：{e}"));
+                    errors.push(format!("恢复代理配置失败：{e}"));
                 }
             }
         }
@@ -646,6 +856,46 @@ mod tests {
         assert!(tz.is_ok());
         assert!(!tz.unwrap().is_empty());
     }
+    #[test]
+    fn dns_baseline_tracks_scopes_and_options_without_treating_reachability_as_configuration() {
+        let a = "DNS configuration\nresolver #1\n domain : example.cn\n nameserver[0] : 223.5.5.5\n reach : 0x00000002 (Reachable)\n order : 100\n";
+        let b = a
+            .replace("resolver #1", "resolver #8")
+            .replace("0x00000002 (Reachable)", "0x00000000 (Not Reachable)");
+        assert_eq!(normalized_dns(a), normalized_dns(&b));
+        for changed in [
+            a.replace("example.cn", "example.com"),
+            a.replace("223.5.5.5", "1.1.1.1"),
+            a.replace("100", "200"),
+        ] {
+            assert_ne!(normalized_dns(a), normalized_dns(&changed));
+        }
+        let servers = vec!["223.5.5.5".into()];
+        assert_eq!(
+            dns_policy_check(&servers, Some(&normalized_dns(a))).status,
+            "observed"
+        );
+        assert_eq!(dns_policy_check(&servers, None).status, "unknown");
+        assert_eq!(dns_policy_check(&[], Some(a)).status, "unknown");
+    }
+    #[test]
+    fn an_optional_client_api_failure_does_not_invalidate_the_network_path() {
+        let mut mode =
+            CheckResult::local("proxy-mode", "模式", "match", "全局模式 · TUN 已开启", "");
+        let before = evidence_fingerprint("same-network", &[mode.clone()]);
+        mode.status = "unknown".into();
+        mode.value = "代理模式无法确认".into();
+        assert_eq!(before, evidence_fingerprint("same-network", &[mode]));
+    }
+    #[test]
+    fn unknown_windows_timezone_never_defaults_to_california() {
+        assert!(iana_to_windows_timezone("Unknown/City").is_err());
+        assert_eq!(
+            iana_to_windows_timezone("America/New_York").unwrap(),
+            "Eastern Standard Time"
+        );
+    }
+
     #[test]
     fn parses_dns_ipv4_ipv6_without_duplicate() {
         assert_eq!(

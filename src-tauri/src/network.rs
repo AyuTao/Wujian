@@ -45,10 +45,11 @@ pub(crate) fn route_interface(text: &str) -> Option<&str> {
     })
 }
 fn tunnel(name: &str) -> bool {
-    ["utun", "tun", "tap"].iter().any(|prefix| {
-        name.strip_prefix(prefix)
-            .is_some_and(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()))
-    })
+    matches!(name, "Meta" | "Mihomo" | "mihomo" | "clash")
+        || ["utun", "tun", "tap"].iter().any(|prefix| {
+            name.strip_prefix(prefix)
+                .is_some_and(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()))
+        })
 }
 fn route_check(first: Option<&str>, second: Option<&str>) -> CheckResult {
     let a = first.and_then(route_interface);
@@ -290,6 +291,14 @@ mod tests {
     fn specific_routes_detect_tun_split_routes_and_read_failure() {
         let a = "route to: 1.1.1.1\n interface: utun6\n";
         assert!(route_check(Some(a), Some(a)).value.contains("经 TUN"));
+        let named = "interface: Mihomo";
+        assert!(route_check(Some(named), Some(named))
+            .value
+            .contains("经 TUN"));
+        let ethernet = "interface: Ethernet";
+        assert!(!route_check(Some(ethernet), Some(ethernet))
+            .value
+            .contains("经 TUN"));
         assert!(route_check(Some(a), Some("interface: en0"))
             .value
             .contains("分流"));

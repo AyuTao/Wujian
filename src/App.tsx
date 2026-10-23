@@ -1,27 +1,26 @@
 import { useEffect, useRef, useState } from "react";
+import * as Flags from "country-flag-icons/react/3x2";
 import {
   getSnapshot,
   isNative,
   runChecks,
-  prepareFirewall,
   firewallAction,
-  getTimezoneInfo,
+  prepareFirewall,
   exitApp,
   openExternalUrl,
-  optimizeAllGates,
-  restoreAllNetwork,
   toggleGate,
+  getTimezoneInfo,
+  restoreAllNetwork,
 } from "./lib/api";
-import type {
-  AppSnapshot,
-  FirewallPlan,
-  FirewallReceipt,
-  TimezoneInfo,
-} from "./lib/types";
+import type { AppSnapshot, CheckResult, TimezoneInfo } from "./lib/types";
 import styles from "./App.module.css";
-import * as Flags from "country-flag-icons/react/3x2";
+import { captureFrontendEvent } from "./lib/diagnostics";
 import SettingsDialog from "./components/SettingsDialog";
-import { protectionLabel } from "./lib/protection";
+import { dnsDisplay, dnsEndpoint } from "./lib/dnsDisplay";
+import { egressDisplay, hasEgressAddress } from "./lib/egressDisplay";
+
+const native = isNative();
+const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 function CountryFlag({
   code,
@@ -30,121 +29,28 @@ function CountryFlag({
   code: string;
   style?: React.CSSProperties;
 }) {
-  const FlagComp = (
+  const FlagComponent = (
     Flags as Record<
       string,
       React.ComponentType<{ style?: React.CSSProperties }>
     >
   )[code.toUpperCase()];
-  if (!FlagComp) return null;
-  return (
-    <FlagComp
-      style={{
-        width: "32px",
-        height: "22px",
-        borderRadius: "3px",
-        boxShadow: "0 2px 8px rgba(0,0,0,0.5)",
-        flexShrink: 0,
-        ...style,
-      }}
-    />
+  return FlagComponent ? (
+    <FlagComponent style={style} />
+  ) : (
+    <span style={style}>?</span>
   );
 }
 
-const native = isNative();
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
-// 自动跟随出口国家的时区与解析档案
-interface CountryProfile {
-  code: string;
-  name: string;
-  timezone: string;
-  timezoneLabel: string;
-  dnsTarget: string;
-}
-
-const COUNTRY_PROFILES: Record<string, CountryProfile> = {
-  US: {
-    code: "US",
-    name: "美国 (United States)",
-    timezone: "America/Los_Angeles",
-    timezoneLabel: "美国太平洋时区 (America/Los_Angeles)",
-    dnsTarget: "美国本土合规加密解析通道",
-  },
-  JP: {
-    code: "JP",
-    name: "日本 (Japan)",
-    timezone: "Asia/Tokyo",
-    timezoneLabel: "日本标准时区 (Asia/Tokyo)",
-    dnsTarget: "日本本土合规加密解析通道",
-  },
-  SG: {
-    code: "SG",
-    name: "新加坡 (Singapore)",
-    timezone: "Asia/Singapore",
-    timezoneLabel: "新加坡标准时区 (Asia/Singapore)",
-    dnsTarget: "亚太合规加密解析通道",
-  },
-  GB: {
-    code: "GB",
-    name: "英国 (United Kingdom)",
-    timezone: "Europe/London",
-    timezoneLabel: "伦敦标准时区 (Europe/London)",
-    dnsTarget: "欧洲合规加密解析通道",
-  },
-  DE: {
-    code: "DE",
-    name: "德国 (Germany)",
-    timezone: "Europe/Berlin",
-    timezoneLabel: "中欧标准时区 (Europe/Berlin)",
-    dnsTarget: "欧洲合规加密解析通道",
-  },
-  HK: {
-    code: "HK",
-    name: "中国香港 (Hong Kong)",
-    timezone: "Asia/Hong_Kong",
-    timezoneLabel: "香港标准时区 (Asia/Hong_Kong)",
-    dnsTarget: "亚太国际合规加密解析通道",
-  },
-  TW: {
-    code: "TW",
-    name: "中国台湾 (Taiwan)",
-    timezone: "Asia/Taipei",
-    timezoneLabel: "台北标准时区 (Asia/Taipei)",
-    dnsTarget: "亚太国际合规加密解析通道",
-  },
-  KR: {
-    code: "KR",
-    name: "韩国 (Korea)",
-    timezone: "Asia/Seoul",
-    timezoneLabel: "韩国标准时区 (Asia/Seoul)",
-    dnsTarget: "亚太合规加密解析通道",
-  },
-  CA: {
-    code: "CA",
-    name: "加拿大 (Canada)",
-    timezone: "America/Toronto",
-    timezoneLabel: "加拿大东部时区 (America/Toronto)",
-    dnsTarget: "北美合规加密解析通道",
-  },
-  AU: {
-    code: "AU",
-    name: "澳大利亚 (Australia)",
-    timezone: "Australia/Sydney",
-    timezoneLabel: "澳洲东部时区 (Australia/Sydney)",
-    dnsTarget: "澳洲合规加密解析通道",
-  },
-};
-
 export default function App() {
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [pending, setPending] = useState("check");
   const [error, setError] = useState("");
   const [feedback, setFeedback] = useState("");
-  const [firewallPlan, setFirewallPlan] = useState<FirewallPlan | null>(null);
-  const [firewallReceipt, setFirewallReceipt] =
-    useState<FirewallReceipt | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<
+    "dns" | "timezone" | undefined
+  >();
   const [timezoneInfo, setTimezoneInfo] = useState<TimezoneInfo>({
     current: Intl.DateTimeFormat().resolvedOptions().timeZone,
     original: null,
@@ -158,296 +64,207 @@ export default function App() {
     onConfirm: () => void;
   } | null>(null);
 
-  const generation = useRef(0);
-  const snapshotRef = useRef<AppSnapshot | null>(null);
-  const firewallReceiptRef = useRef<FirewallReceipt | null>(null);
-  snapshotRef.current = snapshot;
-  firewallReceiptRef.current = firewallReceipt;
   const busy = Boolean(pending);
+  const protection = snapshot?.protection;
+  const isArmed = Boolean(protection?.armed);
+  const isTripped = Boolean(protection?.isolationPending);
+  const needsRecovery = Boolean(protection?.filterMayExist && !isArmed);
+  const isolationLoaded =
+    isTripped &&
+    Boolean(protection?.receipt?.configurationActive) &&
+    protection?.receipt?.policyMode === "isolation" &&
+    !protection?.error;
+  const allGatesPassed = Boolean(snapshot?.circuitBreaker?.allPassed);
+  const gates = snapshot?.circuitBreaker?.gates ?? [];
 
-  // 初始化实时网络排查
-  async function initializeAndCheck() {
-    const request = ++generation.current;
-    setPending("check");
-    setError("");
-    try {
-      const data = await getSnapshot();
-      if (request !== generation.current) return;
-      setSnapshot(data);
-
+  async function refresh() {
+    const next = await getSnapshot();
+    setSnapshot(next);
+    if (native) {
       try {
         const tz = await getTimezoneInfo();
         setTimezoneInfo(tz);
       } catch {
         // ignore
       }
+    }
+    return next;
+  }
 
-      try {
-        const status = await firewallAction("status", null, false);
-        setFirewallReceipt(status);
-      } catch {
-        // ignore
-      }
-
-      try {
-        const report = await runChecks(data.networkEpoch);
-        const refreshed = await getSnapshot();
-        setSnapshot({ ...refreshed, ...report });
-      } catch {
-        // ignore
-      }
+  async function perform(name: string, action: () => Promise<void>) {
+    setPending(name);
+    setFeedback("");
+    try {
+      await action();
+      setError("");
     } catch (e) {
-      if (request === generation.current) setError(errorText(e));
+      setError(errorText(e));
     } finally {
-      if (request === generation.current) setPending("");
+      try {
+        await refresh();
+      } catch (e) {
+        setError(errorText(e));
+      }
+      setPending("");
     }
   }
 
   useEffect(() => {
-    void initializeAndCheck();
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (
-        (e.metaKey || e.ctrlKey) &&
-        (e.key === "q" || e.key === "Q" || e.key === "w" || e.key === "W")
-      ) {
-        e.preventDefault();
-        e.stopPropagation();
-        const armed = Boolean(
-          firewallReceiptRef.current?.configurationActive ||
-          snapshotRef.current?.protection?.armed ||
-          snapshotRef.current?.protection?.filterMayExist ||
-          snapshotRef.current?.protection?.dnsModified ||
-          snapshotRef.current?.protection?.isolationPending,
-        );
-        if (armed) {
-          setError(
-            "安全防护运行中。请先点击【停止严格防护】解除网络隔离后，方可退出应用。",
-          );
-        } else {
-          void exitApp();
+    void (async () => {
+      try {
+        const next = await getSnapshot();
+        if (disposed) return;
+        setSnapshot(next);
+        if (native) {
+          try {
+            const tz = await getTimezoneInfo();
+            if (!disposed) setTimezoneInfo(tz);
+          } catch {
+            // ignore
+          }
         }
+        await runChecks(next.networkEpoch, "startup");
+        if (!disposed) await refresh();
+      } catch (e) {
+        if (!disposed) setError(errorText(e));
+      } finally {
+        if (!disposed) setPending("");
       }
-    };
-    window.addEventListener("keydown", handleKeyDown, true);
+    })();
 
-    let unlistenSnapshot: (() => void) | undefined;
     if (native) {
-      import("@tauri-apps/api/event").then(({ listen }) => {
-        listen<AppSnapshot>("snapshot-updated", (event) => {
-          setSnapshot(event.payload);
-          if (event.payload.protection?.error)
-            setError(event.payload.protection.error);
-        }).then((u) => {
-          unlistenSnapshot = u;
-        });
-      });
+      void import("@tauri-apps/api/event")
+        .then(async ({ listen }) => {
+          const stop = await listen<AppSnapshot>(
+            "snapshot-updated",
+            (event) => {
+              if (!disposed) setSnapshot(event.payload);
+            },
+          );
+          if (disposed) stop();
+          else unlisten = stop;
+        })
+        .catch(() => captureFrontendEvent("frontend.event_subscription"));
     }
 
     return () => {
-      generation.current++;
-      window.removeEventListener("keydown", handleKeyDown, true);
-      if (unlistenSnapshot) unlistenSnapshot();
+      disposed = true;
+      unlisten?.();
     };
   }, []);
 
-  useEffect(() => {
-    if (!feedback) return;
-    const timer = window.setTimeout(() => setFeedback(""), 4000);
-    return () => window.clearTimeout(timer);
-  }, [feedback]);
-
-  // 严格防护开关执行
-  async function executeDisguiseAction(active: boolean) {
-    setPending(active ? "disarm" : "arm");
-    setError("");
-    try {
-      let plan = firewallPlan;
-      if (!active && !plan) {
-        plan = await prepareFirewall("");
-        setFirewallPlan(plan);
-      }
-      const receipt = await firewallAction(
-        active ? "release" : "apply",
-        plan?.id ?? null,
-        true,
-      );
-      setFirewallReceipt(receipt);
-      const fresh = await getSnapshot();
-      setSnapshot(fresh);
-      setFeedback(
-        active
-          ? "已停止防护并恢复本工具配置"
-          : protectionLabel(fresh.protection),
-      );
-      if (fresh.protection?.error) setError(fresh.protection.error);
-    } catch (e) {
-      setError(errorText(e));
-      try {
-        setSnapshot(await getSnapshot());
-      } catch {
-        /* keep the last known incident */
-      }
-    } finally {
-      setPending("");
-    }
+  async function recheck() {
+    await perform("check", async () => {
+      const next = await getSnapshot();
+      await runChecks(next.networkEpoch);
+      setFeedback("实时核验完成");
+    });
   }
 
-  async function toggleDisguise() {
-    if (busy || !native) return;
-    const active =
-      snapshot?.protection?.armed ||
-      snapshot?.protection?.isolationPending ||
-      false;
-    if (active) {
-      setConfirmModal({
-        open: true,
-        title: "解除网络严格防护",
-        message:
-          "确认停止防护并解除本工具的隔离规则？DNS 按备份恢复，解除后将恢复联网。",
-        confirmText: "确认解除",
-        isDanger: true,
-        onConfirm: () => void executeDisguiseAction(true),
-      });
-      return;
-    }
-
-    if (!allGatesPassed) {
-      setConfirmModal({
-        open: true,
-        title: "合规检测未全部通过警告",
-        message:
-          "当前档案仍有待核验项。启用后会请求管理员授权阻断公网 IPv6；关键证据缺失、过期或网络变化时，再请求整机隔离，仅保留本机回环。\n\n请先在设置里授权检测并核对代理路径。断流依赖轮询和管理员授权，隔离不会自动解除。是否继续？",
-        confirmText: "强制请求整机隔离",
-        isDanger: true,
-        onConfirm: () => void executeDisguiseAction(false),
-      });
-      return;
-    }
-
-    void executeDisguiseAction(false);
-  }
-
-  // 一键全链路合规优化 (自动灭活 IPv6、锁定安全 DNS、自动对齐当前出口国家时区)
-  async function handleOptimizeAll() {
-    if (busy || !native) return;
-    setPending("optimize-all");
-    setError("");
-    try {
-      const report = await optimizeAllGates();
-      const fresh = await getSnapshot();
-      setSnapshot({ ...fresh, ...report });
+  async function handleToggleGate(gateId: string, enable: boolean) {
+    await perform("toggle-gate", async () => {
+      await toggleGate(gateId, enable);
       const tz = await getTimezoneInfo();
       setTimezoneInfo(tz);
-
       setFeedback(
-        "IPv6 阻断规则已回读；DNS 请在设置中单独配置，时区仅供参考。",
+        gateId === "gate-dns"
+          ? "已复查 DNS 配置，未修改客户端设置"
+          : enable
+            ? "配置操作完成，请核对检测结果"
+            : "本工具配置已恢复",
       );
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setPending("");
-    }
+    });
   }
 
-  // 一键还原初始网络 (恢复网卡 IPv6 自动、恢复系统默认 DNS、恢复原始时区)
+  async function handleOptimizeAll() {
+    await perform("optimize-all", async () => {
+      if (!g4?.passed) await toggleGate("gate-ipv6", true);
+      setFeedback("已请求阻断公网 IPv6；DNS 和时区保持原配置");
+    });
+  }
+
   async function handleRestoreAll() {
-    if (busy || !native) return;
     setConfirmModal({
       open: true,
-      title: "恢复本工具的网络配置",
+      title: "恢复本工具配置",
       message:
-        "将停止防护、解除本工具的防火墙规则，并按备份恢复本工具修改的 DNS。静态原值不会被统一改成 DHCP，失败记录保留供重试。确认恢复？",
-      confirmText: "确认恢复",
+        "将停止守护、解除本工具的隔离和 IPv6 阻断，并恢复本工具备份的 DNS 与时区。不会把所有网卡重置为默认值。",
+      confirmText: "立即还原",
       isDanger: false,
       onConfirm: async () => {
-        setPending("restore-all");
-        setError("");
-        try {
-          const report = await restoreAllNetwork();
-          const fresh = await getSnapshot();
-          setSnapshot({ ...fresh, ...report });
+        await perform("restore-all", async () => {
+          await restoreAllNetwork();
           const tz = await getTimezoneInfo();
           setTimezoneInfo(tz);
-          setFeedback("本工具的规则和 DNS 修改已恢复");
-        } catch (e) {
-          setError(errorText(e));
-        } finally {
-          setPending("");
-        }
+          setFeedback("本工具配置已恢复，请复测联网");
+        });
       },
     });
   }
 
-  // 单关点击开启 / 校准 / 恢复
-  async function handleToggleGate(gateId: string, enable: boolean) {
-    if (busy || !native) return;
-    if (gateId !== "gate-ipv6") {
-      setSettingsOpen(true);
+  async function toggleDisguise() {
+    if (isTripped || needsRecovery) {
+      setConfirmModal({
+        open: true,
+        title: "停止保护并解除规则",
+        message:
+          "网络保持切断。原来的节点和 TUN 恢复后会自己继续。这里会停止保护并恢复联网。",
+        confirmText: "立即解除隔离",
+        isDanger: true,
+        onConfirm: async () => {
+          await perform("disarm", async () => {
+            await firewallAction("release", null, true);
+            setFeedback("已解除断路隔离");
+          });
+        },
+      });
       return;
     }
-    setPending(`gate-${gateId}`);
-    setError("");
-    try {
-      const report = await toggleGate(gateId, enable);
-      const fresh = await getSnapshot();
-      setSnapshot({ ...fresh, ...report });
 
-      setFeedback(enable ? "本工具的 IPv6 阻断规则已回读" : "本工具配置已恢复");
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setPending("");
+    if (isArmed) {
+      setConfirmModal({
+        open: true,
+        title: "停止卧底防护",
+        message:
+          "停止后将卸载常驻保护 helper，解除本工具的防火墙限制，恢复常规联网。",
+        confirmText: "停止防护",
+        isDanger: true,
+        onConfirm: async () => {
+          await perform("disarm", async () => {
+            await firewallAction("release", null, true);
+            setFeedback("已停止防护");
+          });
+        },
+      });
+      return;
     }
+
+    await perform("prepare-guard", async () => {
+      const plan = await prepareFirewall("");
+      setConfirmModal({
+        open: true,
+        title: "确认全局 TUN 整机保护",
+        message: plan.summary,
+        confirmText: "加载防火墙并开启",
+        isDanger: false,
+        onConfirm: async () => {
+          await perform("arm", async () => {
+            await firewallAction("apply", plan.id, true);
+            setFeedback("保护已开启");
+          });
+        },
+      });
+    });
   }
 
-  // 重新排查
-  async function recheck() {
-    if (!snapshot || busy) return;
-    setPending("check");
-    setError("");
-    try {
-      const report = await runChecks(snapshot.networkEpoch);
-      const data = await getSnapshot();
-      setSnapshot({ ...data, ...report });
-      setFeedback("网络环境实时重新核验完成");
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setPending("");
-    }
-  }
-
-  // 关键数据分析
   const checks = snapshot?.checks ?? [];
-  const byId = (id: string) => checks.find((item) => item.id === id);
-  const ip = byId("egress-ipv4");
-  const validIp =
-    ip &&
-    ["match", "review", "observed"].includes(ip.status) &&
-    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip.value);
-  const region = byId("egress-region");
-  const dnsObs = byId("dns-observation");
-
-  const isArmed = Boolean(
-    snapshot?.protection?.armed || snapshot?.protection?.isolationPending,
+  const region = checks.find((c) => c.id === "egress-region");
+  const ipCheck = checks.find(
+    (c) => c.id === "egress-ipv4" || c.id === "egress-ip",
   );
-  const isChecking = pending === "check";
-
-  // 断路器状态判定
-  const cb = snapshot?.circuitBreaker;
-  const isTripped = Boolean(
-    snapshot?.protection?.isolationPending &&
-    snapshot.protection.receipt?.configurationActive &&
-    !snapshot.protection.error,
-  );
-  const isolationUnconfirmed = Boolean(
-    snapshot?.protection?.error ||
-    (snapshot?.protection?.isolationPending && !isTripped),
-  );
-  const gates = cb?.gates ?? [];
-  const allGatesPassed = gates.length >= 6 && gates.every((g) => g.passed);
-  const passedCount = gates.filter((g) => g.passed).length;
 
   const g1 = gates.find((g) => g.id === "gate-ip");
   const g2 = gates.find((g) => g.id === "gate-timezone");
@@ -455,40 +272,61 @@ export default function App() {
   const g4 = gates.find((g) => g.id === "gate-ipv6");
   const g5 = gates.find((g) => g.id === "gate-tunnel");
   const g6 = gates.find((g) => g.id === "gate-mode");
+  const modePassed = Boolean(
+    g6?.passed &&
+    checks.find((check) => check.id === "proxy-mode")?.status === "match",
+  );
+  const dnsConfigPassed = Boolean(g3?.passed && snapshot?.dnsServers.length);
+  const vergeInstalled =
+    checks.find((check) => check.id === "clash-verge-app")?.status === "match";
+  const vergeLabel =
+    checks.find((check) => check.id === "clash-verge-app")?.value ??
+    "未发现 Clash Verge";
 
-  // 提取当时的真实 DNS IP
-  const currentDnsIp = (() => {
-    if (dnsObs?.value) {
-      const match = dnsObs.value.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
-      if (match) return match[0];
-    }
-    const servers = snapshot?.dnsServers ?? [];
-    if (servers.length > 0 && servers[0]) return servers[0];
-    return "未检测";
-  })();
+  const history = useRef<{
+    path: string;
+    ip?: CheckResult;
+    region?: CheckResult;
+    dns?: CheckResult;
+  }>({ path: "" });
+  const path = `${snapshot?.settings.proxyUrl}|${snapshot?.settings.externalIpConsent}|${snapshot?.settings.dnsHttpConsent}`;
+  const previous = history.current.path === path ? history.current : undefined;
+  const dnsCheck = checks.find((c) => c.id === "dns-observation");
+  useEffect(() => {
+    const last: typeof history.current =
+      history.current.path === path ? history.current : { path };
+    history.current = {
+      path,
+      ip:
+        hasEgressAddress(ipCheck) && ipCheck.status !== "stale"
+          ? ipCheck
+          : last.ip,
+      region:
+        hasEgressAddress(ipCheck) && ipCheck.status !== "stale"
+          ? region
+          : last.region,
+      dns:
+        dnsEndpoint(dnsCheck) && dnsCheck?.status !== "stale"
+          ? dnsCheck
+          : last.dns,
+    };
+  }, [path, ipCheck, region, dnsCheck]);
+  const egressView = egressDisplay(ipCheck, region, Date.now(), previous);
+  const isIpPass = Boolean(g1?.passed && egressView.current);
+  const dnsView = dnsDisplay(
+    dnsCheck,
+    Boolean(snapshot?.settings.dnsHttpConsent),
+    Date.now(),
+    previous?.dns,
+  );
+  const currentTimezone =
+    checks.find((c) => c.id === "timezone")?.value || timezoneInfo.current;
 
-  // 出口国家自动推断与联动
-  const parsedCountryCode = (() => {
-    const searchStr = `${region?.value ?? ""} ${g1?.value ?? ""}`;
-    const parenMatch = searchStr.match(/\(([A-Z]{2})\)/);
-    if (parenMatch) return parenMatch[1];
-    const wordMatch = searchStr.match(/\b([A-Z]{2})\b/);
-    if (wordMatch && wordMatch[1] !== "IP") return wordMatch[1];
-    return "";
-  })();
-  const currentProfile: CountryProfile = COUNTRY_PROFILES[
-    parsedCountryCode
-  ] ?? {
-    code: parsedCountryCode,
-    name: `${parsedCountryCode} 出海节点`,
-    timezone: "America/Los_Angeles",
-    timezoneLabel: "目标节点时区",
-    dnsTarget: `${parsedCountryCode} 本土安全加密通道`,
-  };
+  const isChecking = busy && pending === "check";
 
   return (
     <div className={styles.screen}>
-      {/* 顶部标题区 (单行紧凑) */}
+      {/* 顶部单行标题条 */}
       <header className={styles.topNav}>
         <div className={styles.brandRow}>
           <span className={styles.brandTitle}>無間道</span>
@@ -496,36 +334,43 @@ export default function App() {
           <span className={styles.brandSub}>Dario，我係中國人</span>
         </div>
         <div className={styles.headerRight}>
-          <div
-            className={`${styles.statusBadge} ${
-              isolationUnconfirmed
-                ? styles.badgeWarn
-                : isArmed
-                  ? styles.badgeArmed
-                  : allGatesPassed
-                    ? styles.badgePass
-                    : styles.badgeWarn
-            }`}
-          >
-            {isolationUnconfirmed
-              ? "待授权"
-              : isTripped
-                ? "规则已载入"
-                : isArmed
-                  ? "防护中"
-                  : allGatesPassed
-                    ? `${passedCount}/6 就绪`
-                    : `${passedCount}/6 破绽`}
-          </div>
           <button
             className={styles.btnIconReload}
+            onClick={() => setShowSettings(true)}
             disabled={busy || !snapshot}
-            onClick={() => setSettingsOpen(true)}
-            title="设置与诊断日志"
-            aria-label="设置与诊断日志"
+            title="检测与守护设置"
+            aria-label="设置"
           >
             ⚙
           </button>
+          <div
+            className={`${styles.statusBadge} ${
+              isArmed
+                ? styles.badgeArmed
+                : allGatesPassed
+                  ? styles.badgePass
+                  : styles.badgeWarn
+            }`}
+            title={
+              !isTripped && !isArmed && allGatesPassed
+                ? "全局模式和 TUN 已通过，整机保护尚未开启"
+                : !isTripped && !isArmed
+                  ? "需要全局模式，并指定一个 TUN"
+                  : undefined
+            }
+          >
+            {isTripped
+              ? isolationLoaded
+                ? "已隔断"
+                : "隔断未确认"
+              : isArmed
+                ? protection?.tunnelGuardConfirmed
+                  ? "保护中"
+                  : "保护未核验"
+                : allGatesPassed
+                  ? "可开启保护"
+                  : "条件不足"}
+          </div>
           <button
             className={styles.btnIconReload}
             onClick={() => void recheck()}
@@ -537,49 +382,44 @@ export default function App() {
         </div>
       </header>
 
-      {settingsOpen && snapshot && (
-        <SettingsDialog
-          snapshot={snapshot}
-          onClose={() => setSettingsOpen(false)}
-          onRefresh={async () => {
-            setSnapshot(await getSnapshot());
-          }}
-        />
-      )}
-      {/* 错误提示浮层 */}
+      {/* 提示浮层 */}
       {error && (
         <div className={styles.topToast} onClick={() => setError("")}>
           <span>{error}</span>
         </div>
       )}
+      {feedback && (
+        <div className={styles.bottomFeedback} onClick={() => setFeedback("")}>
+          <span>{feedback}</span>
+        </div>
+      )}
 
-      {/* 400x600 极简单屏主体 */}
+      {/* 400x600 紧凑单屏容器 */}
       <div className={styles.container}>
         <div className={styles.cardsContainer}>
           {/* 1. 属地 */}
           <div
-            className={`${styles.itemCardRow} ${g1?.passed ? styles.rowPass : styles.rowFail}`}
+            className={`${styles.itemCardRow} ${isIpPass ? styles.rowPass : styles.rowFail}`}
+            title={egressView.title}
           >
-            <span className={styles.rowColTitle}>属地</span>
+            <span className={styles.rowColTitle}>出口</span>
             <div className={styles.rowColData}>
               <CountryFlag
-                code={currentProfile.code}
+                code={egressView.countryCode}
                 style={{ width: "18px", height: "13px", flexShrink: 0 }}
               />
               <span
                 className={
-                  g1?.passed ? styles.dataPassColor : styles.dataFailColor
+                  isIpPass ? styles.dataPassColor : styles.dataFailColor
                 }
               >
-                {isChecking && !g1?.passed
+                {isChecking && !hasEgressAddress(ipCheck) && !previous?.ip
                   ? "核验中..."
-                  : validIp
-                    ? `${ip.value}${currentProfile.code ? ` (${currentProfile.code})` : ""}`
-                    : "未连接出海节点"}
+                  : egressView.text}
               </span>
             </div>
             <div className={styles.rowColStamp}>
-              {g1?.passed ? (
+              {isIpPass ? (
                 <span className={styles.redStampPass}>PASS</span>
               ) : (
                 <span className={styles.stampPending}>FAIL</span>
@@ -587,9 +427,10 @@ export default function App() {
             </div>
           </div>
 
-          {/* 2. 时区 */}
+          {/* 2. 时区：持续跟随出口或手动自定义 */}
           <div
             className={`${styles.itemCardRow} ${g2?.passed ? styles.rowPass : styles.rowFail}`}
+            title={g2?.detail}
           >
             <span className={styles.rowColTitle}>时区</span>
             <div className={styles.rowColData}>
@@ -598,29 +439,24 @@ export default function App() {
                   g2?.passed ? styles.dataPassColor : styles.dataFailColor
                 }
               >
-                {timezoneInfo.current || "未知时区"}
+                {currentTimezone || "未知时区"}
+                {snapshot?.settings.timezoneMode === "egress"
+                  ? " · 跟随出口"
+                  : ""}
               </span>
             </div>
             <div className={styles.rowColAction}>
-              {timezoneInfo.current === currentProfile.timezone ? (
-                <button
-                  className={styles.btnGateToggle}
-                  disabled={busy}
-                  onClick={() => void handleToggleGate("gate-timezone", false)}
-                  title="恢复系统原始时区"
-                >
-                  恢复
-                </button>
-              ) : (
-                <button
-                  className={`${styles.btnGateToggle} ${styles.btnGateActive}`}
-                  disabled={busy}
-                  onClick={() => void handleToggleGate("gate-timezone", true)}
-                  title="打开时区说明与设置"
-                >
-                  对齐
-                </button>
-              )}
+              <button
+                className={styles.btnGateToggle}
+                disabled={busy || !snapshot}
+                onClick={() => {
+                  setSettingsSection("timezone");
+                  setShowSettings(true);
+                }}
+                title="设置跟随出口 IP 或手动自定义时区"
+              >
+                设置
+              </button>
             </div>
             <div className={styles.rowColStamp}>
               {g2?.passed ? (
@@ -631,43 +467,85 @@ export default function App() {
             </div>
           </div>
 
-          {/* 3. DNS */}
+          {/* 3. DNS：实际解析出口 */}
           <div
-            className={`${styles.itemCardRow} ${g3?.passed ? styles.rowPass : styles.rowFail}`}
+            className={`${styles.itemCardRow} ${dnsView.current ? styles.rowPass : styles.rowFail}`}
+            title={dnsView.title}
           >
             <span className={styles.rowColTitle}>DNS</span>
             <div className={styles.rowColData}>
-              <CountryFlag
-                code={currentProfile.code}
-                style={{ width: "18px", height: "13px", flexShrink: 0 }}
-              />
+              {dnsView.countryCode && (
+                <CountryFlag
+                  code={dnsView.countryCode}
+                  style={{ width: "18px", height: "13px", flexShrink: 0 }}
+                />
+              )}
               <span
                 className={
-                  g3?.passed ? styles.dataPassColor : styles.dataFailColor
+                  dnsView.current ? styles.dataPassColor : styles.dataFailColor
                 }
               >
-                {isChecking && !g3?.passed ? "核验中..." : currentDnsIp}
+                {isChecking &&
+                !dnsEndpoint(dnsCheck) &&
+                !dnsEndpoint(previous?.dns)
+                  ? "检测中..."
+                  : dnsView.text}
+              </span>
+            </div>
+            <div className={styles.rowColStamp}>
+              <span
+                className={
+                  dnsView.current ? styles.redStampPass : styles.stampPending
+                }
+              >
+                {dnsView.badge}
+              </span>
+            </div>
+          </div>
+
+          <div
+            className={`${styles.itemCardRow} ${dnsConfigPassed ? styles.rowPass : styles.rowFail}`}
+          >
+            <span className={`${styles.rowColTitle} ${styles.dnsConfigTitle}`}>
+              DNS配置
+            </span>
+            <div
+              className={styles.rowColData}
+              title={snapshot?.dnsServers.join("、")}
+            >
+              <span
+                className={
+                  dnsConfigPassed ? styles.dataPassColor : styles.dataFailColor
+                }
+              >
+                {snapshot?.dnsServers.join("、") || "解析入口未知"}
               </span>
             </div>
             <div className={styles.rowColAction}>
               <button
-                className={`${styles.btnGateToggle} ${g3?.passed ? "" : styles.btnGateActive}`}
-                disabled={busy}
-                onClick={() => void handleToggleGate("gate-dns", !g3?.passed)}
+                className={styles.btnGateToggle}
+                disabled={busy || !snapshot}
+                onClick={() => {
+                  setSettingsSection("dns");
+                  setShowSettings(true);
+                }}
+                title="系统 DNS 设置与解析策略"
               >
-                {g3?.passed ? "恢复" : "锁定"}
+                设置
               </button>
             </div>
             <div className={styles.rowColStamp}>
-              {g3?.passed ? (
-                <span className={styles.redStampPass}>PASS</span>
-              ) : (
-                <span className={styles.stampPending}>FAIL</span>
-              )}
+              <span
+                className={
+                  dnsConfigPassed ? styles.redStampPass : styles.stampPending
+                }
+              >
+                {dnsConfigPassed ? "PASS" : "FAIL"}
+              </span>
             </div>
           </div>
 
-          {/* 4. IPv6 */}
+          {/* 5. IPv6 */}
           <div
             className={`${styles.itemCardRow} ${g4?.passed ? styles.rowPass : styles.rowFail}`}
           >
@@ -681,17 +559,20 @@ export default function App() {
                 {isChecking && !g4?.passed
                   ? "核验中..."
                   : g4?.passed
-                    ? "已阻断 / 已停用"
-                    : "尚未核验"}
+                    ? "公网已停用/阻断"
+                    : "公网未停用或未知"}
               </span>
             </div>
             <div className={styles.rowColAction}>
               <button
                 className={`${styles.btnGateToggle} ${g4?.passed ? "" : styles.btnGateActive}`}
-                disabled={busy}
-                onClick={() => void handleToggleGate("gate-ipv6", !g4?.passed)}
+                disabled={busy || isArmed || isTripped}
+                onClick={() =>
+                  void handleToggleGate("gate-ipv6", !protection?.ipv6Filtering)
+                }
+                title="加载或解除本工具的公网 IPv6 阻断规则，不改写网卡配置"
               >
-                {g4?.passed ? "恢复" : "抹除"}
+                {protection?.ipv6Filtering ? "恢复" : "阻断"}
               </button>
             </div>
             <div className={styles.rowColStamp}>
@@ -716,40 +597,73 @@ export default function App() {
               >
                 {isChecking && !g5?.passed
                   ? "核验中..."
-                  : (byId("network-route")?.value ?? "未核验")}
+                  : (g5?.value ?? "TUN 状态未确认")}
               </span>
             </div>
             <div className={styles.rowColStamp}>
-              {g5?.passed ? (
-                <span className={styles.redStampPass}>PASS</span>
-              ) : (
-                <span className={styles.stampPending}>FAIL</span>
-              )}
+              <span
+                className={
+                  g5?.passed ? styles.redStampPass : styles.stampPending
+                }
+              >
+                {g5?.passed ? "PASS" : "FAIL"}
+              </span>
             </div>
           </div>
 
-          {/* 6. 路由 */}
+          {/* Clash Verge 是否装在本机。不提供下载。 */}
           <div
-            className={`${styles.itemCardRow} ${g6?.passed ? styles.rowPass : styles.rowFail}`}
+            className={`${styles.itemCardRow} ${vergeInstalled ? styles.rowPass : styles.rowFail}`}
           >
-            <span className={styles.rowColTitle}>路由</span>
+            <span className={`${styles.rowColTitle} ${styles.dnsConfigTitle}`}>
+              客户端
+            </span>
             <div className={styles.rowColData}>
               <span
                 className={
-                  g6?.passed ? styles.dataPassColor : styles.dataFailColor
+                  vergeInstalled ? styles.dataPassColor : styles.dataFailColor
                 }
               >
-                {isChecking && !g6?.passed
-                  ? "核验中..."
-                  : (byId("proxy-mode")?.value ?? "模式未知")}
+                {vergeLabel}
               </span>
             </div>
             <div className={styles.rowColStamp}>
-              {g6?.passed ? (
-                <span className={styles.redStampPass}>PASS</span>
-              ) : (
-                <span className={styles.stampPending}>FAIL</span>
-              )}
+              <span
+                className={
+                  vergeInstalled ? styles.redStampPass : styles.stampPending
+                }
+              >
+                {vergeInstalled ? "PASS" : "FAIL"}
+              </span>
+            </div>
+          </div>
+
+          {/* 6. 全局模式与 TUN */}
+          <div
+            className={`${styles.itemCardRow} ${modePassed ? styles.rowPass : styles.rowFail}`}
+          >
+            <span className={styles.rowColTitle}>模式</span>
+            <div className={styles.rowColData}>
+              <span
+                className={
+                  modePassed ? styles.dataPassColor : styles.dataFailColor
+                }
+              >
+                {isChecking && !modePassed
+                  ? "核验中..."
+                  : modePassed
+                    ? "全局模式"
+                    : (g6?.value ?? "代理模式未确认")}
+              </span>
+            </div>
+            <div className={styles.rowColStamp}>
+              <span
+                className={
+                  modePassed ? styles.redStampPass : styles.stampPending
+                }
+              >
+                {modePassed ? "PASS" : "FAIL"}
+              </span>
             </div>
           </div>
         </div>
@@ -770,33 +684,50 @@ export default function App() {
             onClick={() => void toggleDisguise()}
           >
             <span>
-              {isTripped
-                ? "解除断路隔离"
-                : isArmed
-                  ? "停止卧底防护"
-                  : allGatesPassed
-                    ? "批准生效 · 潜入美方 AI"
-                    : "强制批准 (破绽将断路)"}
+              {pending === "prepare-guard"
+                ? "正在核对节点和 DNS…"
+                : pending === "arm"
+                  ? "正在加载防火墙…"
+                  : pending === "disarm" || pending === "restore-all"
+                    ? "正在解除保护…"
+                    : isTripped || needsRecovery
+                      ? "解除断路隔离"
+                      : isArmed
+                        ? "停止卧底防护"
+                        : allGatesPassed
+                          ? "检查并开启整机保护"
+                          : "检查全局 TUN 开启条件"}
             </span>
           </button>
+          {pending === "prepare-guard" && (
+            <p className={styles.pendingNote}>正在读取本机代理，还没改网络</p>
+          )}
+          {pending === "arm" && (
+            <p className={styles.pendingNote}>正在写入防火墙规则</p>
+          )}
+          {isTripped && isArmed && Boolean(protection?.tunnelPolicy) && (
+            <p className={styles.pendingNote}>
+              TUN 和原来的节点恢复后，会自动继续保护
+            </p>
+          )}
 
           <div className={styles.dualTools}>
             <button
               className={styles.btnOptimize}
-              disabled={busy}
+              disabled={busy || isArmed || isTripped}
               onClick={() => void handleOptimizeAll()}
-              title="应用公网 IPv6 阻断规则；DNS 在设置中单独配置，时区仅供参考"
+              title="仅加载公网 IPv6 阻断，不改写 DNS 和时区"
             >
-              一键抹除优化
+              阻断公网 IPv6
             </button>
 
             <button
               className={styles.btnRestore}
               disabled={busy}
               onClick={() => void handleRestoreAll()}
-              title="解除本工具规则并按原值恢复 DNS"
+              title="停止守护，仅恢复本工具的修改和备份"
             >
-              还原系统配置
+              恢复本工具配置
             </button>
           </div>
 
@@ -808,23 +739,19 @@ export default function App() {
                 void openExternalUrl("https://browserleaks.com/dns");
               }}
             >
-              权威验证 ↗
+              浏览器复测 ↗
             </a>
 
             <button
               className={styles.btnAuxExit}
               disabled={busy}
               onClick={() => {
-                if (
-                  isArmed ||
-                  snapshot?.protection?.filterMayExist ||
-                  snapshot?.protection?.dnsModified
-                ) {
+                if (isArmed) {
                   setError(
                     "防护运行中！必须先点击【停止卧底防护】后再安全退出。",
                   );
                 } else {
-                  void exitApp();
+                  void perform("exit", exitApp);
                 }
               }}
             >
@@ -834,94 +761,49 @@ export default function App() {
         </div>
       </div>
 
-      {/* 沉浸式拟态确认对话框 */}
-      {confirmModal?.open && (
+      {protection?.error && (
         <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0, 0, 0, 0.8)",
-            backdropFilter: "blur(8px)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 9999,
-          }}
+          className={styles.topToast}
+          role="alert"
+          onClick={() => setShowSettings(true)}
         >
-          <div
-            style={{
-              background: "#0a0f1d",
-              border: "1px solid rgba(56, 189, 248, 0.35)",
-              borderRadius: "8px",
-              padding: "26px 30px",
-              maxWidth: "480px",
-              width: "90%",
-              boxShadow: "0 25px 60px rgba(0, 0, 0, 0.9)",
-              color: "#f8fafc",
-              display: "flex",
-              flexDirection: "column",
-              gap: "16px",
-            }}
-          >
-            <h3
-              style={{
-                margin: 0,
-                fontSize: "17px",
-                color: confirmModal.isDanger ? "#f87171" : "#38bdf8",
-                fontWeight: 700,
-                letterSpacing: "0.5px",
-              }}
-            >
-              {confirmModal.title}
-            </h3>
-            <p
-              style={{
-                margin: 0,
-                fontSize: "14px",
-                lineHeight: "1.65",
-                color: "rgba(255, 255, 255, 0.88)",
-                whiteSpace: "pre-line",
-              }}
-            >
-              {confirmModal.message}
-            </p>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "flex-end",
-                gap: "12px",
-                marginTop: "12px",
-              }}
-            >
+          {protection.error}
+        </div>
+      )}
+      {showSettings && snapshot && (
+        <SettingsDialog
+          snapshot={snapshot}
+          initialSection={settingsSection}
+          onClose={() => {
+            setShowSettings(false);
+            setSettingsSection(undefined);
+          }}
+          onRefresh={async () => {
+            await refresh();
+          }}
+        />
+      )}
+      {/* 确认对话框 */}
+      {confirmModal?.open && (
+        <div className={styles.modalBackdrop} role="dialog" aria-modal="true">
+          <div className={styles.modal}>
+            <h3 className={styles.modalTitle}>{confirmModal.title}</h3>
+            <p className={styles.modalMessage}>{confirmModal.message}</p>
+            <div className={styles.dualTools}>
               <button
+                className={styles.btnRestore}
                 onClick={() => setConfirmModal(null)}
-                style={{
-                  padding: "9px 18px",
-                  background: "rgba(255, 255, 255, 0.08)",
-                  border: "1px solid rgba(255, 255, 255, 0.18)",
-                  borderRadius: "4px",
-                  color: "#cbd5e1",
-                  cursor: "pointer",
-                  fontSize: "13.5px",
-                }}
               >
                 取消
               </button>
               <button
+                className={
+                  confirmModal.isDanger ? styles.btnDanger : styles.btnOptimize
+                }
                 onClick={() => {
-                  const cb = confirmModal.onConfirm;
+                  const action = confirmModal.onConfirm;
                   setConfirmModal(null);
-                  cb();
-                }}
-                style={{
-                  padding: "9px 20px",
-                  background: confirmModal.isDanger ? "#dc2626" : "#0284c7",
-                  border: "none",
-                  borderRadius: "4px",
-                  color: "#ffffff",
-                  fontWeight: "bold",
-                  cursor: "pointer",
-                  fontSize: "13.5px",
+                  void action();
                 }}
               >
                 {confirmModal.confirmText}
@@ -930,9 +812,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      {/* 底部反馈消息 */}
-      {feedback && <div className={styles.bottomFeedback}>{feedback}</div>}
     </div>
   );
 }

@@ -25,3 +25,6 @@ __pycache__/
 *.key
 logs/
 reports/
+
+# This machine-specific incident report is local only
+/docs/DNS分流故障复盘.md

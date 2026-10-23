@@ -3,9 +3,21 @@ use crate::firewall::Receipt;
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
 
+/// Captured only by an explicit start action; never updated by diagnostics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Baseline {
+    pub egress_ip: String,
+    pub dns_fingerprint: String,
+    pub timezone: String,
+    pub proxy_url: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProtectionStatus {
+    pub tunnel_policy: Option<crate::firewall::policy::Policy>,
+    pub tunnel_guard_confirmed: bool,
     pub armed: bool,
     pub dns_modified: bool,
     pub filter_may_exist: bool,
@@ -13,6 +25,8 @@ pub struct ProtectionStatus {
     pub isolation_pending: bool,
     pub receipt: Option<Receipt>,
     pub error: Option<String>,
+    pub baseline: Option<Baseline>,
+    pub incident_reason: Option<String>,
 }
 impl ProtectionStatus {
     pub fn load(dir: &Path) -> Self {
@@ -20,34 +34,44 @@ impl ProtectionStatus {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let mut value = serde_json::from_slice::<Self>(&bytes).unwrap_or_else(|_| Self {
+                    tunnel_policy: None,
+                    tunnel_guard_confirmed: false,
                     armed: true,
                     dns_modified: false,
                     filter_may_exist: true,
                     ipv6_filtering: false,
                     isolation_pending: true,
-                    error: Some("隔离记录损坏，请授权核验或解除隔离".into()),
+                    error: Some("隔离记录损坏，请停止保护后重新开启".into()),
                     receipt: None,
+                    baseline: None,
+                    incident_reason: None,
                 });
                 value.ipv6_filtering = false;
+                value.tunnel_guard_confirmed = false;
                 // A saved receipt is history, never current enforcement evidence.
                 if let Some(r) = &mut value.receipt {
                     r.enforcement_verified = false;
                 }
                 if value.isolation_pending {
-                    value.error = Some(
-                        "发现上次隔离记录；请授权核验或明确解除，程序不会自动恢复联网。".into(),
-                    );
+                    value.error = None;
+                    value
+                        .incident_reason
+                        .get_or_insert_with(|| "网络仍处于切断。同一节点恢复后会自动继续。".into());
                 }
                 value
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => Self {
+                tunnel_policy: None,
+                tunnel_guard_confirmed: false,
                 armed: true,
                 dns_modified: false,
                 filter_may_exist: true,
                 ipv6_filtering: false,
                 isolation_pending: true,
                 receipt: None,
+                baseline: None,
+                incident_reason: None,
                 error: Some(format!("隔离状态读取失败：{e}")),
             },
         }
@@ -77,6 +101,20 @@ impl ProtectionStatus {
     pub fn should_isolate(&self, tripped: bool) -> bool {
         self.armed && tripped && !self.isolation_pending
     }
+    pub fn begin_isolation(&mut self, tripped: bool, reason: Option<String>, retry: bool) -> bool {
+        if !(self.should_isolate(tripped) || retry && self.armed && self.isolation_pending) {
+            return false;
+        }
+        if self.incident_reason.is_none() {
+            self.incident_reason = reason;
+        }
+        self.isolation_pending = true;
+        self.filter_may_exist = true;
+        self.ipv6_filtering = false;
+        self.receipt = None;
+        self.error = Some("等待管理员授权；授权完成前隔离未确认。".into());
+        true
+    }
 }
 
 #[cfg(test)]
@@ -95,15 +133,34 @@ mod tests {
         assert!(status.isolation_pending);
     }
     #[test]
+    fn a_healthy_recheck_never_releases_or_replaces_the_incident() {
+        let mut status = ProtectionStatus::default();
+        assert!(!status.begin_isolation(true, Some("未启用".into()), false));
+        status.armed = true;
+        assert!(!status.begin_isolation(false, None, false));
+        assert!(status.begin_isolation(true, Some("出口已变化".into()), false));
+        assert!(status.receipt.is_none() && status.error.is_some());
+        assert!(!status.begin_isolation(false, None, false));
+        assert!(!status.begin_isolation(true, Some("DNS 已变化".into()), false));
+        assert!(status.begin_isolation(false, None, true));
+        assert_eq!(status.incident_reason.as_deref(), Some("出口已变化"));
+        assert!(status.isolation_pending);
+    }
+    #[test]
     fn restart_does_not_trust_saved_enforcement_or_discard_fault() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let status = ProtectionStatus {
+            tunnel_policy: None,
+            tunnel_guard_confirmed: false,
             armed: true,
             dns_modified: false,
             filter_may_exist: true,
             ipv6_filtering: true,
             isolation_pending: true,
             receipt: Some(Receipt {
+                diagnostic_logs: None,
+                policy_mode: "unknown".into(),
+                guard_policy: None,
                 backend: "fixture".into(),
                 configuration_active: true,
                 enforcement_verified: true,
@@ -112,11 +169,21 @@ mod tests {
                 detail: String::new(),
             }),
             error: None,
+            baseline: Some(Baseline {
+                egress_ip: "203.0.113.8".into(),
+                dns_fingerprint: "locked-config".into(),
+                timezone: "Asia/Tokyo".into(),
+                proxy_url: "http://127.0.0.1:7890".into(),
+            }),
+            incident_reason: Some("DNS 配置变化".into()),
         };
         status.save(&dir).unwrap();
         let restored = ProtectionStatus::load(&dir);
         assert!(restored.armed && restored.isolation_pending);
         assert!(!restored.receipt.unwrap().enforcement_verified);
+        assert!(!restored.ipv6_filtering);
+        assert_eq!(restored.baseline.unwrap().dns_fingerprint, "locked-config");
+        assert_eq!(restored.incident_reason.as_deref(), Some("DNS 配置变化"));
         std::fs::write(dir.join("protection.json"), "bad json").unwrap();
         assert!(ProtectionStatus::load(&dir).isolation_pending);
         std::fs::remove_dir_all(dir).unwrap();

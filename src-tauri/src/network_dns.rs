@@ -312,7 +312,7 @@ where
             .get(n)
             .ok_or("DNS 恢复记录编号无效")?
             .clone();
-        match apply(backup).await {
+        match crate::audit::record_async("dns.restore_adapter", apply(backup)).await {
             Ok(()) => {
                 journal.pending.retain(|v| *v != n);
                 save(dir, journal)?;

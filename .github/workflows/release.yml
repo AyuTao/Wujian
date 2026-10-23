@@ -1,4 +1,4 @@
-name: Beta packages
+name: Private test packages
 
 on:
   workflow_dispatch:
@@ -11,7 +11,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  draft:
+    name: Prepare unpublished test download
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.draft.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: draft
+        name: Create an unpublished draft only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="private-test-${GITHUB_RUN_ID}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --draft --prerelease --title "Private test ${GITHUB_SHA:0:8}" --notes "Unpublished test installers for repository maintainers. Source commit: $GITHUB_SHA. Do not publish this draft."
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: draft
+    permissions:
+      contents: write
     name: Package (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -48,16 +75,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-          key: beta-${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - name: Build beta installers
         run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
+          WUJIAN_BUILD_COMMIT: ${{ github.sha }}
       - name: Collect packages and SHA-256
         shell: python
         run: |
@@ -69,6 +93,7 @@ jobs:
           if not packages:
               raise SystemExit('No packages produced')
           version = json.loads(pathlib.Path('package.json').read_text(encoding='utf-8'))['version']
+          (out / 'build-${{ matrix.target }}.json').write_text(json.dumps({'version': version, 'commit': '${{ github.sha }}', 'target': '${{ matrix.target }}'}, indent=2) + '\n', encoding='utf-8')
           for p in packages:
               suffix = '-setup.exe' if p.suffix.lower() == '.exe' else p.suffix
               name = 'wujian-' + version + '-${{ matrix.target }}' + suffix
@@ -77,38 +102,13 @@ jobs:
                   raise SystemExit('Duplicate package name: ' + name)
               shutil.copy2(p, target)
               (out / (name + '.sha256')).write_bytes((hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name + '\n').encode('utf-8'))
-      - uses: actions/upload-artifact@v4
-        with:
-          name: beta-${{ matrix.target }}
-          path: beta-packages/*
-          if-no-files-found: error
-          retention-days: 14
-
-  draft:
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: beta-*
-          merge-multiple: true
-          path: beta-packages
-      - name: Create or update draft prerelease
+      - name: Upload installers to the unpublished draft
         env:
           GH_TOKEN: ${{ github.token }}
+          DRAFT_TAG: ${{ needs.draft.outputs.tag }}
+        shell: bash
         run: |
-          check_id=$(gh run list --workflow check.yml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId')
-          test -n "$check_id" && test "$check_id" != null
-          gh run watch "$check_id" --exit-status --interval 30
-          version=$(node -p 'require("./package.json").version')
-          tag="v$version"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
-            gh release edit "$tag" --target "$GITHUB_SHA" --notes-file docs/测试版发布说明.md
-            gh release upload "$tag" beta-packages/* --clobber
-          else
-            gh release create "$tag" beta-packages/* --target "$GITHUB_SHA" --draft --prerelease --title "Wujian $version" --notes-file docs/测试版发布说明.md
-          fi
+          set -euo pipefail
+          test "$(gh release view "$DRAFT_TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$DRAFT_TAG" beta-packages/* --clobber
+          echo "Installers uploaded to an unpublished draft; no Actions download artifact was created." >> "$GITHUB_STEP_SUMMARY"

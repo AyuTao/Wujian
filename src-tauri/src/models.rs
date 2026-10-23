@@ -11,6 +11,9 @@ pub struct Settings {
     pub history_days: u64,
     pub pinned_egress_ip: Option<String>,
     pub original_timezone: Option<String>,
+    pub target_timezone: Option<String>,
+    pub timezone_mode: String,
+    pub geoip_database_path: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -23,7 +26,30 @@ impl Default for Settings {
             history_days: 7,
             pinned_egress_ip: None,
             original_timezone: None,
+            target_timezone: None,
+            timezone_mode: "manual".into(),
+            geoip_database_path: None,
         }
+    }
+}
+#[cfg(test)]
+mod timezone_settings_tests {
+    use super::*;
+    #[test]
+    fn previous_settings_keep_manual_mode_and_follow_requires_consent() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.timezone_mode, "manual");
+        settings.timezone_mode = "egress".into();
+        assert!(crate::probes::validate_settings(&settings).is_err());
+        settings.external_ip_consent = true;
+        assert!(crate::probes::validate_settings(&settings).is_ok());
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .timezone_mode,
+            "egress"
+        );
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +72,14 @@ pub struct ToolInfo {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EndpointObservation {
+    pub address: String,
+    pub country_code: Option<String>,
+    pub location: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckResult {
     pub id: String,
     pub label: String,
@@ -57,6 +91,8 @@ pub struct CheckResult {
     pub source: String,
     pub observed_at: String,
     pub integrity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<EndpointObservation>,
 }
 impl CheckResult {
     pub fn local(
@@ -77,6 +113,7 @@ impl CheckResult {
             source: "操作系统只读检查".into(),
             observed_at: chrono::Utc::now().to_rfc3339(),
             integrity: "local_verified".into(),
+            endpoint: None,
         }
     }
     pub fn suggest(mut self, text: &str) -> Self {

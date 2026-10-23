@@ -50,6 +50,20 @@ fn generation_matches(value: &Value, generation: &str) -> bool {
             .any(|v| v["table"]["comment"] == format!("{OWNER}:{generation}"))
     })
 }
+pub async fn check_plan(policy: &super::policy::Policy) -> Result<(), String> {
+    let ruleset: Value = serde_json::from_str(&nft(&["-j", "list", "ruleset"], None).await?)
+        .map_err(|_| "无法解码当前 nftables ruleset")?;
+    if ruleset["nftables"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item.get("flowtable").is_some()))
+    {
+        return Err("检测到 flowtable 加速，已有转发流可能绕过常规过滤；暂不启用该布局".into());
+    }
+    let replace = current().await?.is_some();
+    let script = render::nft(policy, replace)?;
+    nft(&["-c", "-f", "-"], Some(&script)).await?;
+    Ok(())
+}
 pub async fn apply(state: &mut ManagedState, dir: &Path) -> Result<Receipt, String> {
     let ruleset: Value = serde_json::from_str(&nft(&["-j", "list", "ruleset"], None).await?)
         .map_err(|_| "无法解码当前 nftables ruleset")?;

@@ -41,10 +41,27 @@ async fn execute_timed(
     include_stderr: bool,
     timeout: Duration,
 ) -> Result<String, String> {
+    let operation = match program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+    {
+        "pfctl" => "system.pfctl",
+        "nft" => "system.nft",
+        "launchctl" => "system.launchctl",
+        "systemctl" => "system.systemctl",
+        "schtasks.exe" => "system.schtasks",
+        "pkexec" => "system.pkexec",
+        "powershell.exe" => "system.powershell",
+        "osascript" => "system.authorize",
+        "curl" | "curl.exe" => "system.controller",
+        _ => "system.command",
+    };
+    let observed = Instant::now();
     let program = PathBuf::from(program);
     let args: Vec<String> = args.iter().map(|v| v.to_string()).collect();
     let input = input.map(Vec::from);
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let mut command = Command::new(&program);
         command
             .args(args)
@@ -133,7 +150,15 @@ async fn execute_timed(
         Ok(text)
     })
     .await
-    .map_err(|_| "本地命令执行任务异常")?
+    .map_err(|_| "本地命令执行任务异常".to_string())
+    .and_then(|result| result);
+    crate::audit::transition(
+        operation,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().err().map(String::as_str),
+    );
+    crate::audit::timed_observation(operation, observed.elapsed().as_millis() as u64);
+    result
 }
 pub async fn run(program: &Path, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
     execute(program, args, input, false).await

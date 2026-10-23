@@ -60,7 +60,16 @@ describe("default report redaction", () => {
           note: "",
         },
       ],
-      checks: [],
+      checks: [
+        {
+          ...check("observed"),
+          endpoint: {
+            address: "198.51.100.88",
+            countryCode: "US",
+            location: "US · resolver 198.51.100.89",
+          },
+        },
+      ],
       platform: "test",
       version: "test",
       networkEpoch: 0,
@@ -75,15 +84,19 @@ describe("default report redaction", () => {
         monitorIntervalSec: 0,
         historyDays: 7,
         pinnedEgressIp: "198.51.100.99",
+        geoipDatabasePath: "/Users/private/geo/Country.mmdb",
       },
       events: [],
     };
     const json = JSON.stringify(redactReport(snapshot));
     for (const secret of [
       "private-user",
+      "/Users/private/geo/Country.mmdb",
       "secret-host",
       "203.0.113.12",
       "198.51.100.99",
+      "198.51.100.88",
+      "198.51.100.89",
     ])
       expect(json).not.toContain(secret);
     expect(json).toContain("unsupported");

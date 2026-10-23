@@ -109,13 +109,142 @@ fn generation_ok(v: &Value, state: &ManagedState) -> bool {
     }
     true
 }
+fn rules_match(v: &Value, state: &ManagedState) -> bool {
+    if state.policy.tunnel_guard.is_some() {
+        tunnel_rules_ok(v, state)
+    } else {
+        generation_ok(v, state)
+    }
+}
+fn tunnel_rules_ok(v: &Value, state: &ManagedState) -> bool {
+    let Some(guard) = state.policy.tunnel_guard.as_ref() else {
+        return false;
+    };
+    if !profiles_ok(v) {
+        return false;
+    }
+    let Some(rules) = v["rules"].as_array() else {
+        return false;
+    };
+    let plan = render::tunnel_plan(guard);
+    if rules.len() != plan.len() {
+        return false;
+    }
+    let Some(adapters) = string_list(&v["adapters"]) else {
+        return false;
+    };
+    if adapters.is_empty() {
+        return false;
+    }
+    for planned in &plan {
+        let name = format!("Wujian-{}-{}", state.policy.generation, planned.suffix);
+        let Some(rule) = rules.iter().find(|rule| rule["name"] == name) else {
+            return false;
+        };
+        if rule["enabled"] != "True"
+            || rule["action"] != "Block"
+            || rule["description"] != render::OWNER
+            || rule["direction"] != planned.direction
+            || !protocol_ok(rule["protocol"].as_str().unwrap_or(""), planned.protocol)
+            || !ports_ok(&rule["ports"], &planned.ports)
+        {
+            return false;
+        }
+        let Some(addresses) = rule["addresses"].as_array() else {
+            return false;
+        };
+        let Some(actual) = addresses
+            .iter()
+            .map(|value| value.as_str().and_then(address_condition))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        for v4 in [true, false] {
+            if super::cidr::complement(&actual, v4)
+                != super::cidr::complement(&planned.addresses, v4)
+            {
+                return false;
+            }
+        }
+        let Some(interfaces) = string_list(&rule["interfaces"]) else {
+            return false;
+        };
+        if interfaces.is_empty() || interfaces.iter().any(|name| name == &guard.interface) {
+            return false;
+        }
+        for adapter in &adapters {
+            if adapter != &guard.interface && !interfaces.iter().any(|name| name == adapter) {
+                return false;
+            }
+        }
+    }
+    true
+}
+fn string_list(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Value::String(text) => Some(vec![text.clone()]),
+        Value::Number(number) => Some(vec![number.to_string()]),
+        _ => None,
+    }
+}
+fn protocol_ok(actual: &str, expected: &str) -> bool {
+    let actual = actual.to_ascii_lowercase();
+    match expected {
+        "Any" => actual == "any" || actual == "256",
+        "TCP" => actual == "tcp" || actual == "6",
+        "UDP" => actual == "udp" || actual == "17",
+        "ICMPv4" => actual == "icmpv4" || actual == "1" || actual == "icmp",
+        _ => false,
+    }
+}
+fn ports_ok(actual: &Value, expected: &[String]) -> bool {
+    let Some(values) = string_list(actual) else {
+        return expected.is_empty();
+    };
+    let normalize = |text: &str| text.replace(' ', "");
+    if expected.is_empty() {
+        return values.is_empty()
+            || values.iter().all(|value| {
+                let value = value.trim();
+                value.eq_ignore_ascii_case("Any") || value == "*" || value.is_empty()
+            });
+    }
+    values.len() == expected.len()
+        && expected
+            .iter()
+            .all(|want| values.iter().any(|got| normalize(got) == normalize(want)))
+}
+pub fn check_plan(policy: &super::policy::Policy) -> Result<(), String> {
+    let script = render::windows(policy)?;
+    if script.contains("-Action Allow")
+        || !script.contains("-Action Block")
+        || !script.contains("WUJIAN_APPLY_OK")
+    {
+        return Err("Windows 规则草稿无效".into());
+    }
+    if policy.tunnel_guard.is_some()
+        && (!script.contains("Get-NetAdapter") || !script.contains("-InterfaceAlias"))
+    {
+        return Err("Windows 隧道规则草稿无效".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        powershell()?;
+    }
+    Ok(())
+}
 pub async fn apply(state: &mut ManagedState, dir: &Path) -> Result<Receipt, String> {
     let text = script(&render::windows(&state.policy)?, dir).await?;
     if !text.contains("WUJIAN_APPLY_OK") {
         return Err("Windows 防火墙未返回完成回执；请查询或解除当前规则".into());
     }
     let value = current(dir).await?;
-    if !generation_ok(&value, state) {
+    if !rules_match(&value, state) {
         return Err("Windows 活动规则核验失败；已建立的限制保持，请查询或解除".into());
     }
     state.fingerprint = Some(super::fingerprint(&value));
@@ -137,12 +266,15 @@ pub async fn release(dir: &Path) -> Result<Receipt, String> {
 pub async fn status(state: Option<&ManagedState>, dir: &Path) -> Result<Receipt, String> {
     let value = current(dir).await?;
     let active = state.is_some_and(|s| {
-        generation_ok(&value, s) && s.fingerprint == Some(super::fingerprint(&value))
+        rules_match(&value, s) && s.fingerprint == Some(super::fingerprint(&value))
     });
+    let tunnel = state.is_some_and(|s| s.policy.tunnel_guard.is_some());
     Ok(Receipt::new(
         active,
         state.map(|s| s.policy.generation.clone()),
-        if active {
+        if active && tunnel {
+            "Windows 活动规则已按网卡回读：物理网卡上的公网被拦截，指定 TUN 不在拦截名单里。"
+        } else if active {
             "Windows 活动规则、系统配置与地址条件回读匹配；已有流及隧道覆盖仍需实测。"
         } else {
             "Windows 防火墙未核验到完整受管隔断；不能将安装成功当作流量验收。"
@@ -211,6 +343,7 @@ mod tests {
     fn readback_checks_addresses_and_both_directions_not_only_rule_count() {
         let state = ManagedState {
             policy: super::super::policy::Policy {
+                tunnel_guard: None,
                 lockdown: false,
                 ipv6_only: false,
                 version: 1,
@@ -218,6 +351,7 @@ mod tests {
                 cn_networks: vec!["223.5.5.0/24".into()],
                 extra_allowed: vec![],
             },
+            resume: None,
             pf_token: None,
             fingerprint: None,
         };
@@ -231,5 +365,46 @@ mod tests {
         assert!(generation_ok(&v, &state));
         v["rules"][0]["addresses"][0] = "223.5.5.0/24".into();
         assert!(!generation_ok(&v, &state));
+    }
+    #[test]
+    fn tunnel_readback_requires_block_rules_on_every_adapter_except_the_tun() {
+        let mut state = ManagedState {
+            policy: super::super::policy::Policy::isolation(),
+            resume: None,
+            pf_token: None,
+            fingerprint: None,
+        };
+        state.policy.lockdown = false;
+        state.policy.tunnel_guard = Some(super::super::tunnel::fixture());
+        let plan = render::tunnel_plan(state.policy.tunnel_guard.as_ref().unwrap());
+        let rules: Vec<_> = plan
+            .iter()
+            .map(|rule| {
+                serde_json::json!({
+                    "name": format!("Wujian-{}-{}", state.policy.generation, rule.suffix),
+                    "enabled": "True",
+                    "action": "Block",
+                    "description": render::OWNER,
+                    "direction": rule.direction,
+                    "protocol": rule.protocol,
+                    "addresses": rule.addresses.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "interfaces": ["Ethernet"],
+                    "ports": if rule.ports.is_empty() { vec!["Any".to_string()] } else { rule.ports.clone() },
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "profiles": [{"enabled":"True"},{"enabled":"True"},{"enabled":"True"}],
+            "adapters": ["Ethernet", "utun6"],
+            "rules": rules,
+        });
+        assert!(tunnel_rules_ok(&value, &state));
+        let mut exposed = value.clone();
+        exposed["rules"][0]["interfaces"] = serde_json::json!(["Ethernet", "utun6"]);
+        assert!(!tunnel_rules_ok(&exposed, &state));
+        let mut missing = value.clone();
+        missing["adapters"] = serde_json::json!(["Ethernet", "Wi-Fi", "utun6"]);
+        assert!(!tunnel_rules_ok(&missing, &state));
+        check_plan(&state.policy).unwrap();
     }
 }

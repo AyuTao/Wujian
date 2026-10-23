@@ -4,6 +4,24 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let result = (|| -> Result<(), String> {
         match args.get(1).map(String::as_str) {
+            Some("--tunnel-watchdog") if args.len() == 2 => {
+                let rt = tokio::runtime::Runtime::new().map_err(|_| "无法创建运行时")?;
+                rt.block_on(firewall::watchdog())?;
+            }
+            Some("--emergency-release") if args.len() == 2 => {
+                let rt = tokio::runtime::Runtime::new().map_err(|_| "无法创建运行时")?;
+                println!("{}", rt.block_on(firewall::emergency_release())?.detail);
+            }
+            Some("tunnel-fixture") if args.len() == 3 => {
+                let mut policy = Policy::isolation();
+                policy.lockdown = false;
+                policy.tunnel_guard = Some(firewall::tunnel::TunnelGuard { uid: 501, interface: "utun6".into(), node: "synthetic".into(), server: "9.9.9.9".into(), port: 443,
+                    protocols: vec!["tcp".into(), "udp".into()], addresses: vec!["9.9.9.9".parse().unwrap()], selected_chain: vec!["GLOBAL".into(), "synthetic".into()], prepared_at: chrono::Utc::now().to_rfc3339(), country: String::new(), dns_note: String::new(), dns_pins: vec![] });
+                let dir = Path::new(&args[2]);
+                std::fs::create_dir(dir).map_err(|_| "需要一个尚不存在的新目录")?;
+                std::fs::write(dir.join("macos.conf"), firewall::render::pf(&policy)?).map_err(|_| "规则导出失败")?;
+                println!("Synthetic global tunnel rules exported; no firewall changes");
+            }
             Some("probe-executor") if args.len() == 2 => {
                 let rt = tokio::runtime::Runtime::new().map_err(|_| "无法创建运行时")?;
                 print!("{}", rt.block_on(firewall::probe_executor())?);
@@ -15,6 +33,7 @@ fn main() -> ExitCode {
             }
             Some("fixture") if args.len() == 3 => {
                 let policy = Policy {
+                    tunnel_guard: None,
                     lockdown: false,
                     ipv6_only: false,                    version: 1,
                     generation: "c".repeat(32),

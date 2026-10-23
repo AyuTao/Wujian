@@ -1,32 +1,50 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   saveSettings,
-  configureDns,
+  runChecks,
   getDiagnosticLogs,
   exportDiagnosticLogs,
   firewallAction,
   isNative,
+  configureDns,
+  toggleGate,
+  followEgressTimezone,
+  restoreTimezone,
 } from "../lib/api";
 import type { AppSnapshot, DiagnosticEntry } from "../lib/types";
 import { protectionLabel } from "../lib/protection";
 import styles from "./SettingsDialog.module.css";
+import { systemDnsAddresses } from "../lib/dnsConfig";
 
 export default function SettingsDialog({
   snapshot,
   onClose,
   onRefresh,
+  initialSection,
 }: {
   snapshot: AppSnapshot;
   onClose: () => void;
   onRefresh: () => Promise<void>;
+  initialSection?: "dns" | "timezone";
 }) {
   const [settings, setSettings] = useState(snapshot.settings);
-  const [dns, setDns] = useState("");
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [logs, setLogs] = useState<DiagnosticEntry[]>([]);
+  const [dnsInput, setDnsInput] = useState(snapshot.dnsServers.join(", "));
+  const dnsSection = useRef<HTMLElement>(null);
+  const timezoneSection = useRef<HTMLLabelElement>(null);
+  useEffect(() => {
+    if (initialSection === "dns")
+      dnsSection.current?.scrollIntoView({ block: "start" });
+    if (initialSection === "timezone")
+      timezoneSection.current?.scrollIntoView({ block: "start" });
+  }, [initialSection]);
   const native = isNative();
+  const policyLocked = Boolean(
+    snapshot.protection?.armed || snapshot.protection?.isolationPending,
+  );
   async function perform(action: () => Promise<void>) {
     setPending(true);
     setError("");
@@ -53,7 +71,7 @@ export default function SettingsDialog({
     >
       <div className={styles.panel}>
         <header>
-          <h3 id="settings-title">卧底档案 · 设置</h3>
+          <h3 id="settings-title">设置</h3>
           <button disabled={pending} onClick={onClose} aria-label="关闭设置">
             ✕
           </button>
@@ -65,55 +83,61 @@ export default function SettingsDialog({
               {snapshot.protection.error}
             </p>
           )}
-          {snapshot.protection?.receipt && (
-            <p>{snapshot.protection.receipt.detail}</p>
+          {snapshot.protection?.incidentReason && (
+            <p role="status">{snapshot.protection.incidentReason}</p>
           )}
-          <p>
-            Kill Switch
-            依赖轮询与管理员授权，授权完成前隔离未确认；规则回读不能代替实际断流测试。隔离不会自动解除。
-          </p>
-          {snapshot.protection?.filterMayExist && (
-            <div className={styles.actions}>
-              <button
-                disabled={pending}
-                onClick={() =>
-                  void perform(async () => {
-                    await firewallAction("verify", null, false);
-                  })
-                }
-              >
-                授权核验规则
-              </button>
-              {snapshot.protection.isolationPending && (
+          {snapshot.protection?.baseline && (
+            <p className={styles.hint}>
+              {snapshot.protection.baseline.egressIp} ·{" "}
+              {snapshot.protection.baseline.timezone}
+            </p>
+          )}
+          {snapshot.protection?.filterMayExist &&
+            !snapshot.protection.tunnelPolicy && (
+              <div className={styles.actions}>
                 <button
                   disabled={pending}
                   onClick={() =>
                     void perform(async () => {
-                      await firewallAction("apply", null, true);
+                      await firewallAction("verify", null, false);
                     })
                   }
                 >
-                  重试隔离授权
+                  重新核对规则
                 </button>
-              )}
-            </div>
-          )}
+                {snapshot.protection.isolationPending && (
+                  <button
+                    disabled={pending}
+                    onClick={() =>
+                      void perform(async () => {
+                        await firewallAction("isolate", null, true);
+                      })
+                    }
+                  >
+                    重试整机隔断
+                  </button>
+                )}
+              </div>
+            )}
         </section>
         <section>
-          <h4>检测授权与路径</h4>
+          <h4>检测</h4>
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void perform(async () => {
                 setSettings(await saveSettings(settings));
-                setMessage("已保存，请关闭设置后重新核验。");
+                if (settings.timezoneMode === "egress")
+                  await followEgressTimezone();
+                await runChecks(snapshot.networkEpoch, "settings");
+                setMessage("已保存");
               });
             }}
           >
             <label>
               <input
                 type="checkbox"
-                disabled={pending}
+                disabled={pending || policyLocked}
                 checked={settings.externalIpConsent}
                 onChange={(e) =>
                   setSettings({
@@ -122,84 +146,174 @@ export default function SettingsDialog({
                   })
                 }
               />
-              允许向 api.ipify.org 发起 HTTPS 出口查询
+              查询出口 IP
             </label>
             <label>
               <input
                 type="checkbox"
-                disabled={pending}
+                disabled={pending || policyLocked}
                 checked={settings.dnsHttpConsent}
                 onChange={(e) =>
                   setSettings({ ...settings, dnsHttpConsent: e.target.checked })
                 }
               />
-              允许 HTTP DNS 辅助采样（*.edns.ip-api.com，明文、可被篡改）
+              观测 DNS
             </label>
-            <label>
-              本机代理 URL
-              <input
-                disabled={pending}
-                value={settings.proxyUrl}
+            <label ref={timezoneSection}>
+              时区
+              <select
+                disabled={pending || policyLocked}
+                value={settings.timezoneMode ?? "manual"}
                 onChange={(e) =>
-                  setSettings({ ...settings, proxyUrl: e.target.value })
+                  setSettings({
+                    ...settings,
+                    timezoneMode: e.target.value as "manual" | "egress",
+                    externalIpConsent:
+                      e.target.value === "egress"
+                        ? true
+                        : settings.externalIpConsent,
+                  })
                 }
-                placeholder="http://127.0.0.1:7890"
+              >
+                <option value="egress">跟随出口</option>
+                <option value="manual">手动</option>
+              </select>
+            </label>
+            {snapshot.settings.timezoneMode === "egress" && (
+              <p className={styles.hint} role="status">
+                {snapshot.checks.find((check) => check.id === "timezone-follow")
+                  ?.value ?? "等待出口"}
+              </p>
+            )}
+            <label>
+              手动时区
+              <input
+                disabled={
+                  pending || policyLocked || settings.timezoneMode === "egress"
+                }
+                value={settings.targetTimezone ?? ""}
+                onChange={(e) =>
+                  setSettings({
+                    ...settings,
+                    targetTimezone: e.target.value.trim() || null,
+                  })
+                }
+                placeholder="Asia/Shanghai"
                 spellCheck={false}
               />
             </label>
-            <p>
-              留空使用直接检测路径；发现系统代理时跳过，避免绕过代理误测。本工具不修改客户端的规则/全局模式。DNS
-              单次采样不能证明全系统无泄漏。
-            </p>
-            <button disabled={pending}>保存检测设置</button>
+            {policyLocked && (
+              <p className={styles.hint}>保护中不能改这些设置。</p>
+            )}
+            <div className={styles.actions}>
+              <button disabled={pending || policyLocked}>保存</button>
+              {settings.timezoneMode === "egress" && (
+                <button
+                  type="button"
+                  disabled={
+                    pending ||
+                    !native ||
+                    snapshot.protection?.isolationPending ||
+                    Boolean(
+                      snapshot.protection?.armed &&
+                      !snapshot.protection?.tunnelGuardConfirmed,
+                    )
+                  }
+                  onClick={() =>
+                    void perform(async () => {
+                      if (!policyLocked)
+                        setSettings(await saveSettings(settings));
+                      const tz = await followEgressTimezone();
+                      await runChecks(snapshot.networkEpoch, "settings");
+                      setMessage(`时区已设为 ${tz.current}`);
+                    })
+                  }
+                >
+                  跟随出口
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={
+                  pending ||
+                  policyLocked ||
+                  !settings.targetTimezone ||
+                  !native ||
+                  settings.timezoneMode === "egress"
+                }
+                onClick={() =>
+                  void perform(async () => {
+                    setSettings(
+                      await saveSettings({
+                        ...settings,
+                        timezoneMode: "manual",
+                      }),
+                    );
+                    await toggleGate("gate-timezone", true);
+                    await runChecks(snapshot.networkEpoch, "settings");
+                    setMessage("已应用指定时区。");
+                  })
+                }
+              >
+                应用手动时区
+              </button>
+              {snapshot.settings.originalTimezone && (
+                <button
+                  type="button"
+                  disabled={pending || policyLocked || !native}
+                  onClick={() =>
+                    void perform(async () => {
+                      const tz = await restoreTimezone();
+                      setSettings({
+                        ...settings,
+                        timezoneMode: "manual",
+                        originalTimezone: null,
+                        targetTimezone: tz.current,
+                      });
+                      await runChecks(snapshot.networkEpoch, "settings");
+                      setMessage("已恢复原时区");
+                    })
+                  }
+                >
+                  恢复原时区
+                </button>
+              )}
+            </div>
           </form>
         </section>
-        <section>
-          <h4>DNS 设置</h4>
-          <p>当前解析器：{snapshot.dnsServers.join("、") || "未知"}</p>
-          <p>
-            输入现有解析器的 IPv4，以逗号分隔。应用前向 UDP 53 查询 example.com
-            验证可用，再请求管理员授权并备份原值。恢复时保留原先的静态值/自动模式。
+        <section ref={dnsSection}>
+          <h4>DNS</h4>
+          <p className={styles.hint}>
+            {snapshot.dnsServers.join("、") || "系统 DNS 未知"}
           </p>
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void perform(async () => {
-                await configureDns(dns.split(/[,，\s]+/).filter(Boolean));
-                setMessage("DNS 已修改并回读，请重新核验和浏览器复测。");
+                await configureDns(systemDnsAddresses(dnsInput));
+                await runChecks(snapshot.networkEpoch, "settings");
+                setMessage("系统 DNS 已写入");
               });
             }}
           >
             <label>
-              解析器 IPv4
+              系统 DNS
               <input
-                disabled={pending}
-                value={dns}
-                onChange={(e) => setDns(e.target.value)}
-                placeholder="填写代理客户端提供的实际地址"
+                disabled={pending || policyLocked || !native}
+                value={dnsInput}
+                onChange={(e) => setDnsInput(e.target.value)}
+                placeholder="223.5.5.5, 114.114.114.114"
+                spellCheck={false}
               />
             </label>
-            <button
-              disabled={
-                pending ||
-                !native ||
-                !dns.trim() ||
-                snapshot.protection?.isolationPending
-              }
-            >
-              验证并应用 DNS
-            </button>
+            <button disabled={pending || policyLocked || !native}>写入</button>
           </form>
-          <p>
-            时区仅供参考，国家级地区信息无法推断节点城市时区，本工具不再自动改写时区。
-          </p>
         </section>
         <section>
-          <h4>诊断日志</h4>
-          <p>
-            日志只保存在本机，约 2 MiB
-            轮转。仅记录操作、结果、耗时和错误类别，不写入
-            IP、代理凭据、原始错误、命令参数或用户路径。
+          <h4>日志</h4>
+          <p className={styles.hint}>
+            导出会收集 App 和系统保护日志。Windows/Linux
+            可能请求管理员权限；取消后仍导出 App 日志。
           </p>
           <div className={styles.actions}>
             <button
@@ -210,17 +324,20 @@ export default function SettingsDialog({
                 })
               }
             >
-              查看最近日志
+              查看
             </button>
             <button
               disabled={pending || !native}
               onClick={() =>
                 void perform(async () => {
-                  setMessage(`日志已导出：${await exportDiagnosticLogs()}`);
+                  const result = await exportDiagnosticLogs();
+                  setMessage(
+                    `日志已导出：${result.path}（${result.systemLogs === "included" ? "含系统保护日志" : result.systemLogs === "partial" ? "部分系统保护日志缺失" : "仅 App 日志，系统保护日志未收集"}）${result.appHealthy ? "" : "；日志健康检查发现缺失，详见导出文件。"}`,
+                  );
                 })
               }
             >
-              导出诊断日志
+              导出
             </button>
           </div>
           {logs.length > 0 && (
@@ -228,7 +345,7 @@ export default function SettingsDialog({
               {logs
                 .map(
                   (l) =>
-                    `${l.at} ${l.operation} ${l.outcome}${l.errorKind ? ` (${l.errorKind})` : ""}`,
+                    `${l.at} [${l.source || "legacy"}] ${l.operation} ${l.outcome}${l.errorKind ? ` (${l.errorKind})` : ""}${l.durationMs != null ? ` ${l.durationMs}ms` : ""}${l.operationId ? ` #${l.operationId.slice(0, 8)}` : ""}`,
                 )
                 .join("\n")}
             </pre>

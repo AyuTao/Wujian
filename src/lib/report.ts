@@ -48,11 +48,23 @@ export function redactReport(snapshot: AppSnapshot) {
       detail: redactText(check.detail),
       suggestion: check.suggestion ? redactText(check.suggestion) : null,
       source: redactText(check.source),
+      ...(check.endpoint
+        ? {
+            endpoint: {
+              address: "[IP 已隐藏]",
+              countryCode: check.endpoint.countryCode,
+              location: redactText(check.endpoint.location),
+            },
+          }
+        : {}),
     })),
     settings: {
       ...snapshot.settings,
       proxyUrl: snapshot.settings.proxyUrl ? "[代理地址已隐藏]" : "",
       pinnedEgressIp: snapshot.settings.pinnedEgressIp ? "[IP 已隐藏]" : null,
+      geoipDatabasePath: snapshot.settings.geoipDatabasePath
+        ? "[本地路径已隐藏]"
+        : null,
     },
     events: snapshot.events.map((event) => ({
       ...event,

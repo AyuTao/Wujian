@@ -41,6 +41,11 @@ export interface CheckResult {
     | "tls_verified"
     | "http_unverified"
     | "unverified";
+  endpoint?: {
+    address: string;
+    countryCode: string | null;
+    location: string;
+  };
 }
 export interface Settings {
   theme: "system" | "light" | "dark";
@@ -51,6 +56,9 @@ export interface Settings {
   historyDays: number;
   pinnedEgressIp?: string | null;
   originalTimezone?: string | null;
+  targetTimezone?: string | null;
+  timezoneMode?: "manual" | "egress";
+  geoipDatabasePath?: string | null;
 }
 
 export interface TimezoneInfo {
@@ -114,6 +122,7 @@ export interface FirewallPlan {
   rules: string;
 }
 export interface FirewallReceipt {
+  policyMode?: "unknown" | "tunnel" | "isolation" | "ipv6" | "legacy";
   backend: string;
   configurationActive: boolean;
   enforcementVerified: boolean;
@@ -123,7 +132,16 @@ export interface FirewallReceipt {
 }
 
 export interface ProtectionStatus {
+  tunnelPolicy?: unknown | null;
+  tunnelGuardConfirmed?: boolean;
   armed: boolean;
+  incidentReason?: string | null;
+  baseline?: {
+    egressIp: string;
+    dnsFingerprint: string;
+    timezone: string;
+    proxyUrl: string;
+  } | null;
   isolationPending: boolean;
   dnsModified?: boolean;
   filterMayExist?: boolean;
@@ -133,10 +151,22 @@ export interface ProtectionStatus {
 }
 
 export interface DiagnosticEntry {
+  operationId?: string | null;
+  source?: string;
+  version?: string;
+  platform?: string;
+  arch?: string;
+  buildCommit?: string | null;
   at: string;
   session: string;
   operation: string;
   outcome: string;
   errorKind: string | null;
   durationMs: number | null;
+}
+
+export interface DiagnosticExport {
+  path: string;
+  systemLogs: "included" | "partial" | "unavailable";
+  appHealthy: boolean;
 }

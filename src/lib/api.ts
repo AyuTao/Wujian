@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke as nativeInvoke, isTauri } from "@tauri-apps/api/core";
 import type {
   AppSnapshot,
   CheckReport,
@@ -11,6 +11,18 @@ import type {
   DiagnosticEntry,
 } from "./types";
 import { redactReport } from "./report";
+import { captureFrontendEvent } from "./diagnostics";
+async function invoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  try {
+    return await nativeInvoke<T>(command, args);
+  } catch (error) {
+    captureFrontendEvent("frontend.ipc_failure");
+    throw error;
+  }
+}
 export const isNative = () => typeof window !== "undefined" && isTauri();
 const wait = () => new Promise((resolve) => setTimeout(resolve, 480));
 const now = () => new Date().toISOString();
@@ -88,8 +100,12 @@ export async function saveSettings(settings: Settings): Promise<Settings> {
   demo.settings = structuredClone(settings);
   return structuredClone(settings);
 }
-export async function runChecks(expectedEpoch: number): Promise<CheckReport> {
-  if (isNative()) return invoke<CheckReport>("run_checks", { expectedEpoch });
+export async function runChecks(
+  expectedEpoch: number,
+  trigger: "manual" | "startup" | "settings" = "manual",
+): Promise<CheckReport> {
+  if (isNative())
+    return invoke<CheckReport>("run_checks", { expectedEpoch, trigger });
   await wait();
   const make = (
     id: string,
@@ -144,6 +160,16 @@ export async function runChecks(expectedEpoch: number): Promise<CheckReport> {
       demo.settings.dnsHttpConsent ? "review" : "not_run",
     ),
   ];
+  const dnsObservation = demo.checks.find(
+    (check) => check.id === "dns-observation",
+  );
+  if (dnsObservation && demo.settings.dnsHttpConsent) {
+    dnsObservation.endpoint = {
+      address: "203.0.113.8",
+      countryCode: null,
+      location: "示例地区（模拟）",
+    };
+  }
   demo.observedAt = now();
   demo.events.unshift({
     id: String(Date.now()),
@@ -193,7 +219,7 @@ export async function prepareFirewall(
   });
 }
 export async function firewallAction(
-  action: "apply" | "release" | "status" | "verify",
+  action: "apply" | "release" | "status" | "verify" | "isolate",
   planId: string | null,
   acknowledge: boolean,
 ): Promise<FirewallReceipt> {
@@ -217,7 +243,9 @@ export async function setTimezone(
   targetTimezone: string,
 ): Promise<TimezoneInfo> {
   if (isNative()) {
-    return invoke<TimezoneInfo>("set_system_timezone", { targetTimezone });
+    return invoke<TimezoneInfo>("set_system_timezone", {
+      targetTz: targetTimezone,
+    });
   }
   demo.settings.originalTimezone =
     demo.settings.originalTimezone ?? "Asia/Shanghai";
@@ -285,10 +313,16 @@ export async function configureDns(servers: string[]): Promise<void> {
   if (!isNative()) throw new Error("DNS 设置只能在桌面应用中修改。");
   return invoke<void>("configure_dns", { servers });
 }
+export async function followEgressTimezone(): Promise<TimezoneInfo> {
+  if (!isNative()) throw new Error("跟随出口时区只能在桌面应用中执行。");
+  return invoke<TimezoneInfo>("follow_egress_timezone");
+}
 export async function getDiagnosticLogs(): Promise<DiagnosticEntry[]> {
   return isNative() ? invoke<DiagnosticEntry[]>("get_diagnostic_logs") : [];
 }
-export async function exportDiagnosticLogs(): Promise<string> {
+export async function exportDiagnosticLogs(): Promise<
+  import("./types").DiagnosticExport
+> {
   if (!isNative()) throw new Error("桌面版才能导出诊断日志。");
-  return invoke<string>("export_diagnostic_logs");
+  return invoke<import("./types").DiagnosticExport>("export_diagnostic_logs");
 }

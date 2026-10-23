@@ -20,7 +20,7 @@
   padding: 18px;
   color: #e2e8f0;
   font-size: 12px;
-  line-height: 1.65;
+  line-height: 1.45;
   user-select: text;
   box-sizing: border-box;
 }
@@ -41,8 +41,8 @@
 }
 .panel section {
   border-top: 1px solid #233349;
-  margin-top: 16px;
-  padding-top: 14px;
+  margin-top: 12px;
+  padding-top: 12px;
 }
 .panel p {
   margin: 8px 0;
@@ -87,9 +87,20 @@
   overflow: auto;
   font-size: 10px;
 }
+.panel details {
+  margin-top: 16px;
+}
+.panel summary {
+  color: #7dd3fc;
+  cursor: pointer;
+}
 .panel :focus-visible {
   outline: 2px solid #38bdf8;
   outline-offset: 2px;
+}
+.hint {
+  margin: 0;
+  color: #94a3b8;
 }
 .actions {
   display: flex;
