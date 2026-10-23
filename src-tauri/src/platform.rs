@@ -1010,7 +1010,7 @@ async fn choose_directory_windows() -> Result<Option<String>, String> {
     {
         let script = "Add-Type -AssemblyName System.Windows.Forms | Out-Null; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = '选择保存日志的文件夹'; if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit 0 }; Write-Output $dialog.SelectedPath";
         let text = crate::firewall::command::run(
-            &crate::firewall::windows::powershell()?,
+            &crate::firewall::system_powershell()?,
             &["-NoProfile", "-STA", "-Command", script],
             None,
         )
