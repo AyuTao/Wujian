@@ -1032,7 +1032,22 @@ mod tests {
         let contents = bundle.join("Contents");
         fs::create_dir_all(contents.join("MacOS")).unwrap();
         let exe = contents.join("MacOS/fixture");
-        fs::copy("/usr/bin/true", &exe).unwrap();
+        // Use an ordinary locally built executable, like the application. An
+        // Apple system binary can have platform/architecture restrictions that
+        // remain after re-signing and are unrelated to the helper installer.
+        let source = root.join("fixture.c");
+        fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        let compiled = std::process::Command::new("/usr/bin/cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "fixture compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(contents.join("Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>fixture</string><key>CFBundleIdentifier</key><string>io.wujian.signature-test</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>"#).unwrap();
         let signed = std::process::Command::new("/usr/bin/codesign")
@@ -1060,10 +1075,13 @@ mod tests {
         );
         sign_standalone(&standalone).unwrap();
         assert!(verify().status.success());
-        assert!(std::process::Command::new(&standalone)
-            .status()
-            .unwrap()
-            .success());
+        let executed = std::process::Command::new(&standalone).output().unwrap();
+        assert!(
+            executed.status.success(),
+            "standalone fixture failed: {}; {}",
+            executed.status,
+            String::from_utf8_lossy(&executed.stderr)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
