@@ -1,3 +1,4 @@
+import { regionName } from "../lib/regionDisplay";
 import { useEffect, useState } from "react";
 import {
   saveSettings,
@@ -15,11 +16,16 @@ import {
   isNative,
   configureDns,
   followEgressTimezone,
+  getSystemRegion,
+  followEgressRegion,
+  restoreSystemRegion,
+  openSystemRegionSettings,
 } from "../lib/api";
-import type { AppSnapshot, DiagnosticEntry } from "../lib/types";
+import type { AppSnapshot, DiagnosticEntry, RegionInfo } from "../lib/types";
 import { notifyError, notifyOk } from "../lib/notify";
 import { protectionLabel } from "../lib/protection";
 import styles from "./SettingsDialog.module.css";
+import { physicalDnsDisplay } from "../lib/systemDns";
 import { systemDnsAddresses } from "../lib/dnsConfig";
 
 function logLine(entry: DiagnosticEntry): string {
@@ -42,11 +48,14 @@ export default function SettingsDialog({
   initialSection?: "dns" | "timezone";
 }) {
   const [settings, setSettings] = useState(snapshot.settings);
+  const [region, setRegion] = useState<RegionInfo | null>(null);
+  const [regionError, setRegionError] = useState("");
   const [pending, setPending] = useState(false);
   const [logs, setLogs] = useState<DiagnosticEntry[]>([]);
   const [logDir, setLogDir] = useState("");
   const [exportPath, setExportPath] = useState("");
-  const [dnsInput, setDnsInput] = useState(snapshot.dnsServers.join(", "));
+  const physicalDns = physicalDnsDisplay(snapshot.physicalDns);
+  const [dnsInput, setDnsInput] = useState(physicalDns.servers.join(", "));
   const [tab, setTab] = useState<"general" | "dns" | "logs">(
     initialSection === "dns" ? "dns" : "general",
   );
@@ -70,6 +79,23 @@ export default function SettingsDialog({
       .then(setLogDir)
       .catch(() => setLogDir(""));
   }, []);
+  useEffect(() => {
+    if (!isNative()) return;
+    let active = true;
+    getSystemRegion()
+      .then((value) => {
+        if (active) {
+          setRegion(value);
+          setRegionError("");
+        }
+      })
+      .catch((error) => {
+        if (active) setRegionError(String(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, [snapshot.checks.find((check) => check.id === "system-region")?.value]);
   const native = isNative();
   const policyLocked = Boolean(
     snapshot.protection?.armed || snapshot.protection?.isolationPending,
@@ -272,11 +298,93 @@ export default function SettingsDialog({
               </button>
             </div>
           </form>
+          <h4>系统国家/地区</h4>
+          <p className={styles.hint}>
+            当前：
+            {regionName(
+              region?.current ??
+                snapshot.checks.find((check) => check.id === "system-region")
+                  ?.value,
+            )}
+            ；界面语言保持原样。
+          </p>
+          <p className={styles.hint}>
+            {regionError ||
+              snapshot.checks.find((check) => check.id === "system-region")
+                ?.detail ||
+              region?.detail ||
+              "中国大陆、香港、澳门地区将自动跟随已确认的 IP 出口；出口未知时建议手动修改。"}
+          </p>
+          {region && !region.followingEnabled && (
+            <p className={styles.hint}>
+              地区自动跟随已暂停；点击“立即跟随地区”可重新启用。
+            </p>
+          )}
+          {region?.restartRequired && (
+            <p className={styles.hint}>
+              部分应用需重启，Linux 桌面可能需重新登录。
+            </p>
+          )}
+          <div className={styles.actions}>
+            <button
+              type="button"
+              disabled={
+                pending ||
+                !native ||
+                Boolean(snapshot.protection?.isolationPending)
+              }
+              onClick={() =>
+                void perform(async () => {
+                  const next = await followEgressRegion();
+                  setRegion(next);
+                  setRegionError("");
+                  notifyOk(next.detail);
+                })
+              }
+            >
+              立即跟随地区
+            </button>
+            <button
+              type="button"
+              disabled={pending || !native}
+              onClick={() => void perform(openSystemRegionSettings)}
+            >
+              系统地区设置
+            </button>
+            <button
+              type="button"
+              disabled={pending || !native || !region?.canRestore}
+              onClick={() =>
+                void perform(async () => {
+                  const next = await restoreSystemRegion();
+                  setRegion(next);
+                  setRegionError("");
+                  notifyOk("已恢复地区并暂停自动跟随");
+                })
+              }
+            >
+              恢复原地区
+            </button>
+          </div>
         </section>
         <section hidden={tab !== "dns"}>
           <h4>DNS</h4>
           <p className={styles.hint}>
-            {snapshot.dnsServers.join("、") || "系统 DNS 未知"}
+            当前生效入口：{snapshot.dnsServers.join("、") || "未知"}
+          </p>
+          <p className={styles.hint}>
+            {snapshot.physicalDns?.runtimeOnly
+              ? "网卡运行时 DNS"
+              : "物理网卡保存的 DNS"}
+            ：{physicalDns.detail}
+            <br />
+            最近读取：
+            {snapshot.physicalDns?.observedAt
+              ? new Date(snapshot.physicalDns.observedAt).toLocaleTimeString()
+              : "未知"}
+            <br />
+            生效入口可能包含 TUN / VPN。配置里出现 114
+            等国内地址不会单独阻止开启保护，也不能单凭地址判定泄露。
           </p>
           <p className={styles.hint}>海外公共 DNS 预设</p>
           <div className={styles.actions}>
@@ -292,7 +400,7 @@ export default function SettingsDialog({
                     await configureDns(preset.servers);
                     setDnsInput(preset.servers.join(", "));
                     await runChecks(snapshot.networkEpoch, "settings");
-                    notifyOk(`已应用 ${preset.name} DNS，原配置已备份`);
+                    notifyOk(`已应用 ${preset.name} DNS，停止保护后保留`);
                   })
                 }
               >
@@ -301,8 +409,11 @@ export default function SettingsDialog({
             ))}
           </div>
           <p className={styles.hint}>
-            修改系统 DNS；实际解析位置以检测为准。代理客户端的内部 DNS
-            需在客户端设置。
+            macOS / Windows 修改现有物理网卡的 IPv4
+            DNS，包含暂时断网的网卡；Linux 仅修改活动接口的运行时
+            DNS。成功后停止保护会保留新值，改回请手动填写。
+            代理客户端可能在退出时覆盖系统 DNS，建议先退出客户端再修改；内部 DNS
+            需在客户端设置，实际解析位置仍需检测。
           </p>
           {policyLocked && (
             <p className={styles.hint}>请先停止整机保护，再修改 DNS。</p>
@@ -313,7 +424,7 @@ export default function SettingsDialog({
               void perform(async () => {
                 await configureDns(systemDnsAddresses(dnsInput));
                 await runChecks(snapshot.networkEpoch, "settings");
-                notifyOk("系统 DNS 已写入");
+                notifyOk("系统 DNS 已写入，停止保护后保留");
               });
             }}
           >

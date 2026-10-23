@@ -19,12 +19,12 @@ pub(crate) fn overseas_system_dns() -> Vec<IpAddr> {
     ]
 }
 
-/// Drop the rollback journal after an explicit overseas DNS write.
+/// Commit an explicit system DNS write.
 /// Stopping protection must not put the previous resolvers back.
 pub(crate) fn discard_recovery(dir: &Path) -> Result<(), String> {
     let path = dir.join("network-recovery.json");
     if path.exists() {
-        std::fs::remove_file(&path).map_err(|_| "海外 DNS 已写入，原始记录已保留")?;
+        std::fs::remove_file(&path).map_err(|_| "DNS 已写入，原始记录已保留")?;
     }
     Ok(())
 }
@@ -46,11 +46,90 @@ impl Change {
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-struct Backup {
-    service: String,
-    automatic: bool,
-    servers: Vec<String>,
+pub(crate) struct Backup {
+    pub service: String,
+    pub automatic: bool,
+    pub servers: Vec<String>,
 }
+/// Read-only physical adapter state, distinct from the effective resolver stack
+/// (which can also contain VPN/TUN and scoped resolvers).
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PhysicalDns {
+    pub adapters: Vec<Backup>,
+    pub observed_at: String,
+    pub error: Option<String>,
+    pub runtime_only: bool,
+}
+
+pub(crate) fn resolver_kind(servers: &[String]) -> &'static str {
+    if servers.is_empty() {
+        "empty"
+    } else if servers.iter().any(|s| {
+        matches!(
+            s.split('%').next().unwrap_or(s),
+            "114.114.114.114"
+                | "114.114.115.115"
+                | "223.5.5.5"
+                | "223.6.6.6"
+                | "119.29.29.29"
+                | "119.28.28.28"
+                | "182.254.116.116"
+                | "182.254.118.118"
+                | "180.76.76.76"
+                | "1.2.4.8"
+                | "210.2.4.8"
+                | "101.226.4.6"
+                | "123.125.81.6"
+        )
+    }) {
+        "domestic"
+    } else {
+        "configured"
+    }
+}
+impl PhysicalDns {
+    fn kind(&self) -> &'static str {
+        if self.error.is_some() {
+            return "unavailable";
+        }
+        if self.adapters.is_empty() {
+            return "empty";
+        }
+        if self.adapters.iter().all(|b| b.automatic) {
+            return "automatic";
+        }
+        resolver_kind(
+            &self
+                .adapters
+                .iter()
+                .flat_map(|b| b.servers.clone())
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+pub(crate) async fn inspect() -> PhysicalDns {
+    let result = tokio::time::timeout(Duration::from_secs(4), capture_mode(false))
+        .await
+        .unwrap_or_else(|_| Err("物理网卡 DNS 读取超时".into()));
+    let (adapters, error) = match result {
+        Ok(adapters) => (adapters, None),
+        Err(error) => {
+            crate::audit::transition("dns.physical_read", "error", Some(&error));
+            (vec![], Some("物理网卡 DNS 读取失败，请重新核验".into()))
+        }
+    };
+    let state = PhysicalDns {
+        adapters,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        error,
+        runtime_only: cfg!(target_os = "linux"),
+    };
+    // Classifications only: never export adapter names or resolver addresses.
+    crate::audit::transition("dns.physical", state.kind(), None);
+    state
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Journal {
     platform: String,
@@ -136,15 +215,39 @@ fn valid_answer(reply: &[u8], id: &[u8]) -> bool {
     false
 }
 async fn cmd(program: &str, args: &[&str]) -> Result<String, String> {
-    crate::firewall::command::run(Path::new(program), args, None).await
+    let operation = match (program, args.first().copied()) {
+        ("/usr/sbin/networksetup", Some("-listnetworkserviceorder")) => "dns.services.read",
+        ("/sbin/ifconfig", _) => "dns.interface.read",
+        ("/usr/sbin/networksetup", Some("-getdnsservers")) => "dns.servers.read",
+        ("/usr/sbin/networksetup", Some("-setdnsservers")) => "dns.servers.write",
+        _ => "dns.platform.command",
+    };
+    crate::audit::record_async(
+        operation,
+        crate::firewall::command::run(Path::new(program), args, None),
+    )
+    .await
+}
+async fn read_cmd(program: &str, args: &[&str], audited: bool) -> Result<String, String> {
+    if audited {
+        cmd(program, args).await
+    } else {
+        crate::platform::run_cmd_checked(program, args).await
+    }
 }
 #[cfg(target_os = "windows")]
 async fn powershell(script: &str) -> Result<String, String> {
+    powershell_mode(script, true).await
+}
+#[cfg(target_os = "windows")]
+async fn powershell_mode(script: &str, audited: bool) -> Result<String, String> {
     let script = format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); {script}");
-    crate::firewall::command::run(
-        &crate::firewall::system_powershell()?,
+    let path = crate::firewall::system_powershell()?;
+    let path = path.to_str().ok_or("PowerShell 路径无法读取")?;
+    read_cmd(
+        path,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
-        None,
+        audited,
     )
     .await
 }
@@ -157,7 +260,10 @@ fn service_order(text: &str) -> Vec<(String, String)> {
         if line.starts_with('(') && !line.starts_with("(Hardware") {
             name = line
                 .split_once(") ")
-                .filter(|(n, _)| n.trim_start_matches('(').parse::<u32>().is_ok())
+                .filter(|(n, _)| {
+                    let n = n.trim_start_matches('(');
+                    n == "*" || n.parse::<u32>().is_ok()
+                })
                 .map(|(_, n)| n.to_string());
         } else if let Some((_, dev)) = line.split_once("Device: ") {
             if let Some(name) = name.take() {
@@ -200,23 +306,40 @@ fn addresses(text: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 async fn capture() -> Result<Vec<Backup>, String> {
+    capture_mode(true).await
+}
+async fn capture_mode(audited: bool) -> Result<Vec<Backup>, String> {
     #[cfg(target_os = "macos")]
     {
-        let list = cmd("/usr/sbin/networksetup", &["-listnetworkserviceorder"]).await?;
+        let list = read_cmd(
+            "/usr/sbin/networksetup",
+            &["-listnetworkserviceorder"],
+            audited,
+        )
+        .await?;
         let mut result = vec![];
         for (service, dev) in service_order(&list) {
             if !physical_nic(&dev) {
                 continue;
             }
-            let info = match cmd("/sbin/ifconfig", &[&dev]).await {
-                Ok(info) => info,
-                Err(error) if interface_missing(&error) => continue,
+            match read_cmd("/sbin/ifconfig", &[&dev], audited).await {
+                Ok(_) => {}
+                Err(error) if interface_missing(&error) => {
+                    if audited {
+                        crate::audit::event("dns.interface.read", "skipped", None, None);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
-            };
-            if !info.lines().any(|l| l.trim() == "status: active") {
-                continue;
             }
-            let text = cmd("/usr/sbin/networksetup", &["-getdnsservers", &service]).await?;
+            // DNS belongs to the saved network service, not its link state.
+            // Include disconnected/disabled services without enabling them.
+            let text = read_cmd(
+                "/usr/sbin/networksetup",
+                &["-getdnsservers", &service],
+                audited,
+            )
+            .await?;
             let automatic = text.starts_with("There aren't any DNS Servers");
             let servers = if automatic { vec![] } else { addresses(&text)? };
             if !automatic && servers.is_empty() {
@@ -232,13 +355,13 @@ async fn capture() -> Result<Vec<Backup>, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let script = r#"$a=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | ForEach-Object {
+        let script = r#"$a=@(Get-NetAdapter -Physical | ForEach-Object {
             $guid=[guid]$_.InterfaceGuid;
             $p='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\'+$guid.ToString('B');
             $raw=(Get-ItemProperty -LiteralPath $p -ErrorAction Stop).NameServer;
             @{service=$guid.ToString('D'); automatic=[string]::IsNullOrWhiteSpace($raw); servers=@($raw -split '[,;\s]+' | Where-Object {$_})}
         }); ConvertTo-Json -InputObject $a -Depth 4 -Compress"#;
-        let text = powershell(script).await?;
+        let text = powershell_mode(script, audited).await?;
         let result: Vec<Backup> = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .map_err(|_| "Windows DNS 原始配置解析失败")?;
         for b in &result {
@@ -263,7 +386,7 @@ async fn capture() -> Result<Vec<Backup>, String> {
                 continue;
             }
             let service = entry.file_name().to_string_lossy().into_owned();
-            let text = cmd("/usr/bin/resolvectl", &["dns", &service])
+            let text = read_cmd("/usr/bin/resolvectl", &["dns", &service], audited)
                 .await
                 .map_err(|e| format!("仅支持 systemd-resolved 管理的 DNS，未修改：{e}"))?;
             let tail = text.split_once(':').ok_or("无法读取原 DNS")?.1.trim();
@@ -362,6 +485,95 @@ where
         ))
     }
 }
+/// Journal every adapter before mutation, including adapters newly present on
+/// a retry. Only a fully verified explicit write becomes the new baseline.
+async fn apply_with<F, Fut>(
+    current: Vec<Backup>,
+    change: &Change,
+    keep: bool,
+    dir: &Path,
+    mut apply: F,
+) -> Result<(), String>
+where
+    F: FnMut(Backup) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let path = dir.join("network-recovery.json");
+    let mut journal = if path.exists() {
+        if !keep {
+            return Err("已有 DNS 修改等待恢复，请先还原后再修改".into());
+        }
+        let journal: Journal =
+            serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
+                .map_err(|_| "DNS 恢复记录损坏，未修改")?;
+        if journal.platform != std::env::consts::OS
+            || journal.pending.iter().any(|n| *n >= journal.original.len())
+        {
+            return Err("DNS 恢复记录无效，未修改".into());
+        }
+        journal
+    } else {
+        Journal {
+            platform: std::env::consts::OS.into(),
+            original: vec![],
+            pending: vec![],
+        }
+    };
+    let servers: Vec<String> = change.servers.iter().map(ToString::to_string).collect();
+    let written: std::collections::HashSet<_> = current.iter().map(|b| b.service.clone()).collect();
+    for backup in current {
+        let n = match journal
+            .original
+            .iter()
+            .position(|b| b.service == backup.service)
+        {
+            Some(n) => {
+                if !journal.pending.contains(&n) {
+                    // An earlier restore completed for this adapter. Its current
+                    // value is now the original for this new attempt.
+                    journal.original[n] = backup.clone();
+                }
+                n
+            }
+            None => {
+                journal.original.push(backup.clone());
+                journal.original.len() - 1
+            }
+        };
+        if !journal.pending.contains(&n) {
+            journal.pending.push(n);
+        }
+        save(dir, &journal)?; // write-ahead original BEFORE each adapter mutation
+        let next = Backup {
+            service: backup.service,
+            automatic: false,
+            servers: servers.clone(),
+        };
+        if let Err(e) = crate::audit::record_async("dns.apply_adapter", apply(next)).await {
+            return Err(format!(
+                "DNS 配置未完成：{e}；请使用恢复按钮，原始记录已保留"
+            ));
+        }
+    }
+    // Never abandon recovery for an adapter no longer present. Let the user
+    // reconnect it and retry/restore instead of reporting a partial success.
+    if keep
+        && journal
+            .pending
+            .iter()
+            .any(|n| !written.contains(&journal.original[*n].service))
+    {
+        return Err(
+            "部分旧网卡不可用，DNS 配置未完成；请重新连接后重试或恢复，原始记录已保留".into(),
+        );
+    }
+    if keep {
+        discard_recovery(dir)?;
+        crate::audit::event("dns.commit", "ok", None, None);
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute(
     action: &str,
     change: Option<&Change>,
@@ -377,55 +589,14 @@ pub(crate) async fn execute(
         }
         let current = capture().await?;
         if current.is_empty() {
-            return Err("没有可修改的活动物理网卡".into());
+            return Err("没有可修改的物理网卡；Linux 需活动的 systemd-resolved 接口".into());
         }
-        let servers: Vec<String> = change.servers.iter().map(ToString::to_string).collect();
-        if path.exists() {
-            if !keep {
-                return Err("已有 DNS 修改等待恢复，请先还原后再修改".into());
-            }
-            // Keep the existing journal until every adapter is written, so a
-            // failed attempt can still restore the pre-change resolvers.
-            for backup in &current {
-                let next = Backup {
-                    service: backup.service.clone(),
-                    automatic: false,
-                    servers: servers.clone(),
-                };
-                if let Err(e) = set(&next).await {
-                    return Err(format!("DNS 配置未完成：{e}；原始记录已保留"));
-                }
-            }
-        } else {
-            let mut journal = Journal {
-                platform: std::env::consts::OS.into(),
-                original: current,
-                pending: vec![],
-            };
-            save(dir, &journal)?; // durable original state BEFORE the first mutation
-            for n in 0..journal.original.len() {
-                journal.pending.push(n);
-                save(dir, &journal)?; // write-ahead per adapter
-                let next = Backup {
-                    service: journal.original[n].service.clone(),
-                    automatic: false,
-                    servers: servers.clone(),
-                };
-                if let Err(e) = set(&next).await {
-                    return Err(format!(
-                        "DNS 配置未完成：{e}；请使用恢复按钮，原始记录已保留"
-                    ));
-                }
-            }
-        }
-        if keep {
-            discard_recovery(dir)?;
-        }
+        apply_with(current, change, keep, dir, |b| async move { set(&b).await }).await?;
         Ok(crate::firewall::Receipt::new(
             true,
             None,
             if keep {
-                "系统 DNS 已改为 1.1.1.1、1.0.0.1。"
+                "系统 IPv4 DNS 已写入并回读；停止保护将保留新配置。"
             } else {
                 "IPv4 DNS 已修改并回读；这是配置状态，不证明 DNS 无泄漏。"
             },
@@ -459,6 +630,27 @@ pub(crate) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn physical_dns_classifications_do_not_confuse_unknown_automatic_and_static() {
+        let mut state = PhysicalDns::default();
+        assert_eq!(state.kind(), "empty");
+        state.adapters.push(Backup {
+            service: "private adapter name".into(),
+            automatic: true,
+            servers: vec![],
+        });
+        assert_eq!(state.kind(), "automatic");
+        state.adapters[0].automatic = false;
+        state.adapters[0].servers = vec!["1.1.1.1".into()];
+        assert_eq!(state.kind(), "configured");
+        state.adapters[0].servers = vec!["114.114.114.114".into()];
+        assert_eq!(state.kind(), "domestic");
+        state.error = Some("fixture failure".into());
+        assert_eq!(state.kind(), "unavailable");
+        assert_eq!(resolver_kind(&["114.114.114.114".into()]), "domestic");
+        assert_eq!(resolver_kind(&["127.0.0.1".into()]), "configured");
+        assert_eq!(resolver_kind(&[]), "empty");
+    }
     #[test]
     fn overseas_system_dns_is_cloudflare_and_sticks_after_the_journal_is_dropped() {
         let servers = overseas_system_dns();
@@ -506,9 +698,15 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
-    fn only_enabled_physical_services_are_selected() {
+    fn disconnected_and_disabled_physical_services_are_selected_but_tunnels_are_not() {
         let text = "(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n(*) Disabled\n(Hardware Port: Ethernet, Device: en1)\n(2) VPN\n(Hardware Port: VPN, Device: utun6)";
-        assert_eq!(service_order(text), vec![("Wi-Fi".into(), "en0".into())]);
+        assert_eq!(
+            service_order(text),
+            vec![
+                ("Wi-Fi".into(), "en0".into()),
+                ("Disabled".into(), "en1".into())
+            ]
+        );
         let ghost = "(3) iPhone USB\n(Hardware Port: iPhone USB, Device: en9)\n(4) Index\n(Hardware Port: USB, Device: 7)\n(5) LAN\n(Hardware Port: USB LAN, Device: en7)";
         assert_eq!(
             service_order(ghost),
@@ -523,8 +721,158 @@ mod tests {
             "系统操作失败：ifconfig: interface 7 does not exist"
         ));
         assert!(interface_missing("ifconfig: interface en9 does not exist"));
+        assert!(interface_missing(
+            "系统操作失败：ifconfig:interface en7 does not exist."
+        ));
         assert!(interface_missing("接口不存在"));
         assert!(!interface_missing("系统操作失败：permission denied"));
+    }
+    #[tokio::test]
+    async fn explicit_manual_and_preset_dns_survive_protection_release() {
+        for servers in [
+            vec!["1.1.1.1", "1.0.0.1"],
+            vec!["8.8.8.8", "8.8.4.4"],
+            vec!["192.0.2.53"],
+        ] {
+            let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut written = vec![];
+            let change = Change {
+                servers: servers.iter().map(|s| s.parse().unwrap()).collect(),
+            };
+            let original = vec![
+                Backup {
+                    service: "Wi-Fi".into(),
+                    automatic: false,
+                    servers: vec!["114.114.114.114".into()],
+                },
+                Backup {
+                    service: "Offline Ethernet".into(),
+                    automatic: true,
+                    servers: vec![],
+                },
+            ];
+            apply_with(original, &change, true, &dir, |b| {
+                written.push(b);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap();
+            assert_eq!(written.len(), 2);
+            assert!(written.iter().all(|b| !b.automatic && b.servers == servers));
+            assert!(!dir.join("network-recovery.json").exists());
+            // The real release dispatcher must have nothing to restore. If it
+            // tried writing the OS here the fake service names would fail.
+            assert!(
+                !execute("network-release", None, &dir)
+                    .await
+                    .unwrap()
+                    .configuration_active
+            );
+            assert!(written.iter().all(|b| b.servers == servers));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn retry_journals_new_adapters_and_recovers_both_after_failure() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let wifi = Backup {
+            service: "Wi-Fi".into(),
+            automatic: false,
+            servers: vec!["114.114.114.114".into()],
+        };
+        let ethernet = Backup {
+            service: "Ethernet".into(),
+            automatic: true,
+            servers: vec![],
+        };
+        save(
+            &dir,
+            &Journal {
+                platform: std::env::consts::OS.into(),
+                original: vec![wifi.clone()],
+                pending: vec![0],
+            },
+        )
+        .unwrap();
+        let current = vec![
+            Backup {
+                servers: vec!["8.8.8.8".into()],
+                ..wifi.clone()
+            },
+            ethernet.clone(),
+        ];
+        let result = apply_with(
+            current,
+            &Change {
+                servers: overseas_system_dns(),
+            },
+            true,
+            &dir,
+            |b| async move {
+                if b.service == "Ethernet" {
+                    Err("fixture readback failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        let mut saved: Journal =
+            serde_json::from_slice(&std::fs::read(dir.join("network-recovery.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.original, vec![wifi.clone(), ethernet.clone()]);
+        assert_eq!(saved.pending, vec![0, 1]);
+        let mut restored = vec![];
+        restore_with(&mut saved, &dir, |b| {
+            restored.push(b);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(restored, vec![ethernet, wifi]);
+        assert!(saved.pending.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn commit_never_discards_recovery_for_a_disconnected_removed_adapter() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        save(
+            &dir,
+            &Journal {
+                platform: std::env::consts::OS.into(),
+                original: vec![Backup {
+                    service: "Unplugged USB".into(),
+                    automatic: true,
+                    servers: vec![],
+                }],
+                pending: vec![0],
+            },
+        )
+        .unwrap();
+        let result = apply_with(
+            vec![Backup {
+                service: "Wi-Fi".into(),
+                automatic: true,
+                servers: vec![],
+            }],
+            &Change {
+                servers: overseas_system_dns(),
+            },
+            true,
+            &dir,
+            |_| std::future::ready(Ok(())),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("原始记录已保留"));
+        let saved: Journal =
+            serde_json::from_slice(&std::fs::read(dir.join("network-recovery.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.pending, vec![0, 1]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn malformed_empty_and_truncated_dns_responses_are_not_available() {

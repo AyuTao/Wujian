@@ -11,11 +11,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const FOREIGN_DNS_LEAK: &str = "国外域名的 DNS 仍走直连或未确认路径，查询会从本机出去";
-const FOREIGN_DNS_SHAPE: &str = "国外 DNS 必须写成 https://公网IPv4/…#策略组，不能直连";
-const DOMESTIC_DNS_OTHER: &str = "国内 DNS 指向了其他节点，无法确认解析路径";
 const DOMESTIC_DNS_NOTE: &str =
     "当前国内域名策略仍是直连，开启后这些查询会被阻断，国内网站可能打不开。";
+const UNCONFIRMED_DNS_NOTE: &str =
+    "DNS 配置路径未完全确认；保护会限制隧道外公网直连，若解析失败请检查客户端 DNS。";
 const HIJACK_MISSING: &str = "TUN 没有劫持 53 端口，系统 DNS 可能绕过代理直连";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +32,7 @@ pub struct TunnelGuard {
     /// Display label from the one-time Country.mmdb check. Empty in synthetic fixtures.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub country: String,
-    /// Shown when domestic geosite policies still dial DIRECT. Not an arming failure.
+    /// DNS configuration observations are advisory; firewall readback controls arming.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dns_note: String,
     /// Other proxy nodes used by DNS. Their addresses stay allowed so DNS does not fall back to direct.
@@ -319,27 +318,82 @@ struct UpstreamHit {
     extra_node: Option<String>,
 }
 
-/// Foreign resolvers may use another concrete proxy node. DIRECT still leaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DnsIssue {
+    Disabled,
+    PrimaryMissing,
+    Malformed,
+    ProxyMissing,
+    Direct,
+    RouteUnknown,
+    Shape,
+    RulesModeUnknown,
+    BootstrapMissing,
+}
+impl DnsIssue {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Disabled => "dns_proxy_disabled",
+            Self::PrimaryMissing => "dns_primary_missing",
+            Self::Malformed => "dns_config_invalid",
+            Self::ProxyMissing => "dns_proxy_unspecified",
+            Self::Direct => "dns_explicit_direct",
+            Self::RouteUnknown => "dns_route_unconfirmed",
+            Self::Shape => "dns_upstream_format",
+            Self::RulesModeUnknown => "dns_rules_mode_unconfirmed",
+            Self::BootstrapMissing => "dns_bootstrap_missing",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DnsContext {
+    global_mode: bool,
+    respect_rules: bool,
+    bootstrap_present: bool,
+}
+
+/// Match Mihomo's DNS dialer: respect-rules / #RULES uses GLOBAL only when
+/// the LIVE controller confirms Global mode. An explicit #DIRECT overrides it.
+/// Only recognized upstreams contribute extra proxy pins. Unknown formats are
+/// diagnostic warnings and never authorize extra physical-network access.
 fn audit_upstream(
     text: &str,
     domestic: bool,
     proxies: &Value,
     node: &str,
-) -> Result<UpstreamHit, String> {
-    let Some((url, group)) = text.rsplit_once('#') else {
-        return if domestic {
-            Ok(UpstreamHit {
-                domestic_direct: true,
-                extra_node: None,
-            })
-        } else {
-            Err(FOREIGN_DNS_LEAK.into())
-        };
+    context: DnsContext,
+) -> Result<UpstreamHit, DnsIssue> {
+    let (url, group) = match text.rsplit_once('#') {
+        Some((url, group)) => (url, Some(group)),
+        None => (text, None),
+    };
+    let follows_rules = group == Some("RULES") || (group.is_none() && context.respect_rules);
+    let group = if follows_rules {
+        if !context.global_mode {
+            return Err(DnsIssue::RulesModeUnknown);
+        }
+        if !context.bootstrap_present {
+            return Err(DnsIssue::BootstrapMissing);
+        }
+        "GLOBAL"
+    } else if let Some(group) = group {
+        group
+    } else if domestic {
+        return Ok(UpstreamHit {
+            domestic_direct: true,
+            extra_node: None,
+        });
+    } else {
+        return Err(DnsIssue::ProxyMissing);
     };
     if !domestic && !foreign_literal_doh(url) {
-        return Err(FOREIGN_DNS_SHAPE.into());
+        return Err(DnsIssue::Shape);
     }
-    match (route_of(proxies, group, node)?, domestic) {
+    match (
+        route_of(proxies, group, node).map_err(|_| DnsIssue::RouteUnknown)?,
+        domestic,
+    ) {
         (Route::Same, _) => Ok(UpstreamHit {
             domestic_direct: false,
             extra_node: None,
@@ -352,66 +406,164 @@ fn audit_upstream(
             domestic_direct: false,
             extra_node: Some(name),
         }),
-        (Route::Unclear, true) => Err(DOMESTIC_DNS_OTHER.into()),
-        (Route::Direct | Route::Unclear, false) => Err(FOREIGN_DNS_LEAK.into()),
+        (Route::Unclear, _) => Err(DnsIssue::RouteUnknown),
+        (Route::Direct, false) => Err(DnsIssue::Direct),
     }
 }
 
 struct DnsReport {
     note: Option<String>,
     extra_nodes: Vec<String>,
+    issues: Vec<(&'static str, DnsIssue)>,
 }
 
-fn check_dns(config: &Value, proxies: &Value, node: &str) -> Result<DnsReport, String> {
+fn check_dns(config: &Value, proxies: &Value, node: &str, global_mode: bool) -> DnsReport {
+    check_dns_with(
+        config,
+        proxies,
+        node,
+        global_mode,
+        |operation, outcome, kind| {
+            crate::audit::transition_kind(operation, outcome, kind);
+        },
+    )
+}
+
+fn check_dns_with(
+    config: &Value,
+    proxies: &Value,
+    node: &str,
+    global_mode: bool,
+    mut emit: impl FnMut(&'static str, &'static str, Option<&'static str>),
+) -> DnsReport {
     let dns = &config["dns"];
+    let context = DnsContext {
+        global_mode,
+        respect_rules: dns["respect-rules"] == true,
+        bootstrap_present: dns["proxy-server-nameserver"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty() && items.iter().all(Value::is_string)),
+    };
+    emit(
+        "guard.dns.respect_rules",
+        if context.respect_rules {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        None,
+    );
+    emit(
+        "guard.dns.bootstrap",
+        if context.bootstrap_present {
+            "configured"
+        } else {
+            "absent"
+        },
+        None,
+    );
     if dns["enable"] != true {
-        return Err("请先开启代理 DNS，再准备整机保护".into());
+        emit(
+            "guard.dns.enable",
+            "warning",
+            Some(DnsIssue::Disabled.kind()),
+        );
+        return DnsReport {
+            note: Some(UNCONFIRMED_DNS_NOTE.into()),
+            extra_nodes: vec![],
+            issues: vec![("dns.enable", DnsIssue::Disabled)],
+        };
     }
-    let primary = dns["nameserver"]
-        .as_array()
-        .filter(|v| !v.is_empty())
-        .ok_or("DNS 主解析上游未确认")?;
-    let mut upstreams = Vec::new();
-    for value in primary {
-        upstreams.push((value, false));
-    }
-    match dns.get("nameserver-policy") {
-        None | Some(Value::Null) => {}
-        Some(Value::Object(policies)) => {
-            for (key, value) in policies {
-                let domestic = domestic_policy_key(key);
-                if let Some(list) = value.as_array() {
-                    upstreams.extend(list.iter().map(|item| (item, domestic)));
-                } else {
-                    upstreams.push((value, domestic));
+    emit("guard.dns.enable", "enabled", None);
+    let mut report = DnsReport {
+        note: None,
+        extra_nodes: vec![],
+        issues: vec![],
+    };
+    // Audit each section even if a previous one fails. Emit one aggregate event
+    // per section so healthy polling cannot flood logs for mixed policies.
+    let mut section = |field: &'static str,
+                       operation: &'static str,
+                       upstreams: Vec<(&Value, bool)>,
+                       schema_error: Option<DnsIssue>| {
+        let empty = upstreams.is_empty();
+        let mut failure = schema_error;
+        let mut domestic_direct = false;
+        for (value, domestic) in upstreams {
+            let hit = value
+                .as_str()
+                .ok_or(DnsIssue::Malformed)
+                .and_then(|text| audit_upstream(text, domestic, proxies, node, context));
+            match hit {
+                Ok(hit) => {
+                    domestic_direct |= hit.domestic_direct;
+                    if let Some(name) = hit.extra_node {
+                        if name != node && !report.extra_nodes.contains(&name) {
+                            report.extra_nodes.push(name);
+                        }
+                    }
+                }
+                Err(issue) => {
+                    failure.get_or_insert(issue);
                 }
             }
         }
-        Some(_) => return Err("DNS 域名策略无法核对".into()),
-    }
-    match dns.get("fallback") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(fallbacks)) => {
-            upstreams.extend(fallbacks.iter().map(|item| (item, false)));
+        if let Some(issue) = failure {
+            emit(operation, "warning", Some(issue.kind()));
+            report.issues.push((field, issue));
+        } else if domestic_direct {
+            emit(operation, "domestic_direct", None);
+            report.note = Some(DOMESTIC_DNS_NOTE.to_string());
+        } else {
+            emit(operation, if empty { "absent" } else { "verified" }, None);
         }
-        Some(_) => return Err("DNS fallback 无法核对".into()),
-    }
-    let mut domestic_direct = false;
-    let mut extra_nodes = Vec::new();
-    for (value, domestic) in upstreams {
-        let text = value.as_str().ok_or("DNS 上游配置无法核对")?;
-        let hit = audit_upstream(text, domestic, proxies, node)?;
-        domestic_direct |= hit.domestic_direct;
-        if let Some(name) = hit.extra_node {
-            if name != node && !extra_nodes.iter().any(|item| item == &name) {
-                extra_nodes.push(name);
+    };
+    let primary = dns["nameserver"].as_array().filter(|v| !v.is_empty());
+    section(
+        "dns.nameserver",
+        "guard.dns.nameserver",
+        primary
+            .map(|items| items.iter().map(|item| (item, false)).collect())
+            .unwrap_or_default(),
+        primary.is_none().then_some(DnsIssue::PrimaryMissing),
+    );
+    let mut policies = vec![];
+    let policy_error = match dns.get("nameserver-policy") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(entries)) => {
+            for (key, value) in entries {
+                let domestic = domestic_policy_key(key);
+                if let Some(items) = value.as_array() {
+                    policies.extend(items.iter().map(|item| (item, domestic)));
+                } else {
+                    policies.push((value, domestic));
+                }
             }
+            None
         }
+        Some(_) => Some(DnsIssue::Malformed),
+    };
+    section(
+        "dns.nameserver-policy",
+        "guard.dns.nameserver_policy",
+        policies,
+        policy_error,
+    );
+    let (fallback, fallback_error) = match dns.get("fallback") {
+        None | Some(Value::Null) => (vec![], None),
+        Some(Value::Array(items)) => (items.iter().map(|item| (item, false)).collect(), None),
+        Some(_) => (vec![], Some(DnsIssue::Malformed)),
+    };
+    section(
+        "dns.fallback",
+        "guard.dns.fallback",
+        fallback,
+        fallback_error,
+    );
+    if !report.issues.is_empty() {
+        report.note = Some(UNCONFIRMED_DNS_NOTE.into());
     }
-    Ok(DnsReport {
-        note: domestic_direct.then(|| DOMESTIC_DNS_NOTE.to_string()),
-        extra_nodes,
-    })
+    report
 }
 
 fn hijacks_port_53(tun: &Value) -> Option<bool> {
@@ -752,12 +904,7 @@ struct Observed {
     dns_pins: Vec<PinnedEndpoint>,
 }
 
-async fn current(uid: u32) -> Result<Observed, String> {
-    if uid == 0 {
-        return Err("必须选择桌面用户的代理，不能使用 root 会话".into());
-    }
-    let controller = open_controller(uid).await?;
-    let configs = controller.configs;
+fn require_tun_controller(configs: &Value) -> Result<(Option<bool>, String), String> {
     if configs["tun"]["enable"] != true {
         return Err("请开启 TUN".into());
     }
@@ -773,6 +920,16 @@ async fn current(uid: u32) -> Result<Observed, String> {
         .filter(|s| tun_name(s))
         .ok_or("控制接口没有返回受支持的 TUN 设备，不能确认隧道归属")?
         .to_string();
+    Ok((api_hijack, device))
+}
+
+async fn current(uid: u32) -> Result<Observed, String> {
+    if uid == 0 {
+        return Err("必须选择桌面用户的代理，不能使用 root 会话".into());
+    }
+    let controller = open_controller(uid).await?;
+    let configs = controller.configs;
+    let (api_hijack, device) = require_tun_controller(&configs)?;
     interface_up(&device).await?;
     for destination in ["1.1.1.1", "8.8.8.8"] {
         if route_device(destination).await?.as_str() != device {
@@ -781,13 +938,25 @@ async fn current(uid: u32) -> Result<Observed, String> {
     }
     let proxies = curl_json(&controller.socket, "proxies").await?;
     let chain = selected(&proxies)?;
-    let config = load_runtime(uid, &controller.socket).await?;
+    let config = load_runtime(uid, &controller.socket).await;
+    crate::audit::transition(
+        "guard.runtime_config",
+        if config.is_ok() {
+            "read"
+        } else {
+            "unavailable"
+        },
+        config.as_ref().err().map(String::as_str),
+    );
+    let config = config?;
     let node = chain.last().ok_or("没有选中节点")?;
     let (server, port, protocols) = endpoint(&config, node)?;
     if api_hijack != Some(true) && hijacks_port_53(&config["tun"]) != Some(true) {
         return Err(HIJACK_MISSING.into());
     }
-    let dns = check_dns(&config, &proxies, node)?;
+    // DNS config syntax is advisory. Enforcement comes from the exact node
+    // allow-list and final physical-interface block, never a resolver exception.
+    let dns = check_dns(&config, &proxies, node, configs["mode"] == "global");
     let mut dns_pins = Vec::new();
     for name in dns.extra_nodes {
         let (pin_server, pin_port, pin_protocols) = endpoint(&config, &name)
@@ -1444,10 +1613,10 @@ pub fn fixture() -> TunnelGuard {
 mod tests {
     use super::*;
     #[test]
-    fn foreign_dns_must_use_the_selected_node_and_domestic_direct_is_only_a_warning() {
+    fn dns_configuration_warnings_keep_known_proxy_pins_without_blocking_arming() {
         let proxies = serde_json::json!({"proxies":{"GLOBAL":{"type":"Selector","now":"node"},"node":{"type":"Shadowsocks"},"DIRECT":{"type":"DIRECT"},"other":{"type":"Trojan"}}});
         let config = serde_json::json!({"dns":{"enable":true,"nameserver":["https://1.1.1.1/dns-query#GLOBAL"],"nameserver-policy":{},"fallback":[]}});
-        let ok = check_dns(&config, &proxies, "node").unwrap();
+        let ok = check_dns(&config, &proxies, "node", true);
         assert!(ok.note.is_none());
         assert!(ok.extra_nodes.is_empty());
         for key in [
@@ -1458,22 +1627,19 @@ mod tests {
             let mut domestic = config.clone();
             domestic["dns"]["nameserver-policy"] =
                 serde_json::json!({key:["https://223.5.5.5/dns-query#DIRECT"]});
-            let note = check_dns(&domestic, &proxies, "node").unwrap();
+            let note = check_dns(&domestic, &proxies, "node", true);
             assert!(note.note.unwrap().contains("直连"));
             assert!(note.extra_nodes.is_empty());
             domestic["dns"]["nameserver-policy"] = serde_json::json!({key:["223.5.5.5"]});
-            assert!(check_dns(&domestic, &proxies, "node")
-                .unwrap()
-                .note
-                .is_some());
+            assert!(check_dns(&domestic, &proxies, "node", true).note.is_some());
             domestic["dns"]["nameserver-policy"] =
                 serde_json::json!({key:["https://223.5.5.5/dns-query#GLOBAL"]});
-            let same = check_dns(&domestic, &proxies, "node").unwrap();
+            let same = check_dns(&domestic, &proxies, "node", true);
             assert!(same.note.is_none());
             assert!(same.extra_nodes.is_empty());
             domestic["dns"]["nameserver-policy"] =
                 serde_json::json!({key:["https://1.1.1.1/dns-query#other"]});
-            let other = check_dns(&domestic, &proxies, "node").unwrap();
+            let other = check_dns(&domestic, &proxies, "node", true);
             assert!(other.note.is_none());
             assert_eq!(other.extra_nodes, ["other"]);
         }
@@ -1485,18 +1651,21 @@ mod tests {
         ] {
             let mut bad = config.clone();
             bad["dns"]["nameserver"] = serde_json::json!([resolver]);
-            assert!(check_dns(&bad, &proxies, "node").is_err(), "{resolver}");
+            assert!(
+                !check_dns(&bad, &proxies, "node", true).issues.is_empty(),
+                "{resolver}"
+            );
             bad["dns"]["nameserver"] = config["dns"]["nameserver"].clone();
             bad["dns"]["nameserver-policy"] =
                 serde_json::json!({"geosite:geolocation-!cn":[resolver]});
             assert!(
-                check_dns(&bad, &proxies, "node").is_err(),
+                !check_dns(&bad, &proxies, "node", true).issues.is_empty(),
                 "policy {resolver}"
             );
             bad["dns"]["nameserver-policy"] = serde_json::json!({});
             bad["dns"]["fallback"] = serde_json::json!([resolver]);
             assert!(
-                check_dns(&bad, &proxies, "node").is_err(),
+                !check_dns(&bad, &proxies, "node", true).issues.is_empty(),
                 "fallback {resolver}"
             );
         }
@@ -1506,10 +1675,214 @@ mod tests {
         via_other["dns"]["nameserver-policy"] =
             serde_json::json!({"geosite:geolocation-!cn":["https://8.8.8.8/dns-query#other"]});
         assert_eq!(
-            check_dns(&via_other, &proxies, "node").unwrap().extra_nodes,
+            check_dns(&via_other, &proxies, "node", true).extra_nodes,
             ["other"]
         );
     }
+    #[test]
+    fn rules_dns_uses_verified_global_selection_and_direct_is_a_warning() {
+        let proxies = serde_json::json!({"proxies":{"GLOBAL":{"type":"Selector","now":"node"},"node":{"type":"Shadowsocks"},"DIRECT":{"type":"DIRECT"}}});
+        let config = serde_json::json!({"dns":{
+            "enable":true, "respect-rules":true,
+            "proxy-server-nameserver":["223.5.5.5"],
+            "nameserver":["https://1.1.1.1/dns-query"],
+            "fallback":["https://1.0.0.1/dns-query"],
+            "nameserver-policy":{"geosite:geolocation-!cn":["https://8.8.8.8/dns-query"]}
+        }});
+        let good = check_dns(&config, &proxies, "node", true);
+        assert!(good.extra_nodes.is_empty() && good.note.is_none());
+        assert_eq!(
+            check_dns(&config, &proxies, "node", false).issues[0].1,
+            DnsIssue::RulesModeUnknown
+        );
+        let mut no_bootstrap = config.clone();
+        no_bootstrap["dns"]["proxy-server-nameserver"] = serde_json::json!([]);
+        assert_eq!(
+            check_dns(&no_bootstrap, &proxies, "node", true).issues[0].1,
+            DnsIssue::BootstrapMissing
+        );
+        let mut direct = config.clone();
+        direct["dns"]["nameserver"] = serde_json::json!(["https://1.1.1.1/dns-query#DIRECT"]);
+        assert_eq!(
+            check_dns(&direct, &proxies, "node", true).issues[0].1,
+            DnsIssue::Direct
+        );
+        let mut explicit_rules = config.clone();
+        explicit_rules["dns"]["respect-rules"] = serde_json::json!(false);
+        explicit_rules["dns"]["nameserver"] =
+            serde_json::json!(["https://1.1.1.1/dns-query#RULES"]);
+        explicit_rules["dns"]["fallback"] = serde_json::json!([]);
+        explicit_rules["dns"]["nameserver-policy"] = serde_json::json!({});
+        assert!(check_dns(&explicit_rules, &proxies, "node", true)
+            .issues
+            .is_empty());
+        assert!(!check_dns(&explicit_rules, &proxies, "node", false)
+            .issues
+            .is_empty());
+        // Other upstream formats remain unverified observations, not arming failures.
+        for upstream in [
+            "https://private-dns.example/dns-query",
+            "8.8.8.8",
+            "tls://8.8.8.8",
+        ] {
+            let mut unsupported = config.clone();
+            unsupported["dns"]["nameserver"] = serde_json::json!([upstream]);
+            assert_eq!(
+                check_dns(&unsupported, &proxies, "node", true).issues[0].1,
+                DnsIssue::Shape
+            );
+        }
+    }
+
+    #[test]
+    fn dns_diagnostics_identify_all_failing_sections_without_private_configuration() {
+        let proxies = serde_json::json!({"proxies":{"GLOBAL":{"type":"Selector","now":"private-node-secret"},"private-node-secret":{"type":"Shadowsocks"}}});
+        let config = serde_json::json!({"dns":{
+            "enable":true,
+            "nameserver":["https://sensitive-resolver.example/private-token"],
+            "fallback":["https://1.1.1.1/dns-query#DIRECT"],
+            "nameserver-policy":{"private-customer.example":["https://user:password@1.1.1.1/private-token#private-node-secret"]}
+        }});
+        let mut events = vec![];
+        let report = check_dns_with(
+            &config,
+            &proxies,
+            "private-node-secret",
+            true,
+            |operation, outcome, kind| events.push((operation, outcome, kind)),
+        );
+        assert_eq!(report.issues[0], ("dns.nameserver", DnsIssue::ProxyMissing));
+        assert_eq!(report.note.as_deref(), Some(UNCONFIRMED_DNS_NOTE));
+        for (op, kind) in [
+            ("guard.dns.nameserver", "dns_proxy_unspecified"),
+            ("guard.dns.nameserver_policy", "dns_upstream_format"),
+            ("guard.dns.fallback", "dns_explicit_direct"),
+        ] {
+            assert!(events.contains(&(op, "warning", Some(kind))));
+            assert_eq!(events.iter().filter(|e| e.0 == op).count(), 1);
+        }
+        let exported = format!(
+            "{:?}{}",
+            report.note,
+            serde_json::to_string(&events).unwrap()
+        );
+        for secret in [
+            "private-node-secret",
+            "sensitive-resolver.example",
+            "private-token",
+            "private-customer.example",
+            "user",
+            "password",
+            "1.1.1.1",
+        ] {
+            assert!(
+                !exported.contains(secret),
+                "private config escaped into diagnostics: {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_diagnostics_do_not_treat_missing_or_invalid_config_as_verified() {
+        let proxies = serde_json::json!({"proxies":{"GLOBAL":{"type":"Selector","now":"node"},"node":{"type":"Shadowsocks"}}});
+        for (config, expected) in [
+            (serde_json::json!({}), "dns_proxy_disabled"),
+            (
+                serde_json::json!({"dns":{"enable":true,"nameserver":[]}}),
+                "dns_primary_missing",
+            ),
+            (
+                serde_json::json!({"dns":{"enable":true,"nameserver":[42]}}),
+                "dns_config_invalid",
+            ),
+            (
+                serde_json::json!({"dns":{"enable":true,"nameserver":["https://1.1.1.1/dns-query#missing-group"]}}),
+                "dns_route_unconfirmed",
+            ),
+            (
+                serde_json::json!({"dns":{"enable":true,"nameserver":["https://1.1.1.1/dns-query#GLOBAL"],"fallback":{}}}),
+                "dns_config_invalid",
+            ),
+        ] {
+            let report = check_dns(&config, &proxies, "node", true);
+            assert_eq!(report.issues[0].1.kind(), expected);
+            assert!(report.note.is_some());
+            assert!(report.extra_nodes.is_empty());
+        }
+    }
+
+    #[test]
+    fn unspecified_dns_is_advisory_and_cannot_add_direct_firewall_exceptions() {
+        let proxies = serde_json::json!({"proxies":{"GLOBAL":{"type":"Selector","now":"node"},"node":{"type":"Shadowsocks"}}});
+        // Matches the reported diagnostic shape: enabled DNS, no explicit proxy,
+        // respect-rules disabled, bootstrap configured, no policy or fallback.
+        let config = serde_json::json!({"dns":{"enable":true,"respect-rules":false,
+            "proxy-server-nameserver":["223.5.5.5"],
+            "nameserver":["8.8.8.8","https://dns.example/dns-query"]}});
+        let report = check_dns(&config, &proxies, "node", true);
+        assert_eq!(report.issues, [("dns.nameserver", DnsIssue::ProxyMissing)]);
+        assert!(report.extra_nodes.is_empty());
+        assert_eq!(report.note.as_deref(), Some(UNCONFIRMED_DNS_NOTE));
+        let mut policy = Policy::isolation();
+        policy.lockdown = false;
+        policy.tunnel_guard = Some(fixture());
+        let before = [
+            super::super::render::pf(&policy).unwrap(),
+            super::super::render::nft(&policy, false).unwrap(),
+            super::super::render::windows(&policy).unwrap(),
+        ];
+        policy.tunnel_guard.as_mut().unwrap().dns_note = report.note.unwrap();
+        policy.validate().unwrap();
+        let after = [
+            super::super::render::pf(&policy).unwrap(),
+            super::super::render::nft(&policy, false).unwrap(),
+            super::super::render::windows(&policy).unwrap(),
+        ];
+        assert_eq!(
+            before, after,
+            "a DNS warning must not change any firewall permit"
+        );
+        assert!(after[0].contains("block drop out quick all"));
+        assert!(!after[0].contains("8.8.8.8") && !after[0].contains("223.5.5.5"));
+        assert!(after[1].contains("drop"));
+        let blocked = super::super::render::tunnel_blocked(policy.tunnel_guard.as_ref().unwrap());
+        assert!(blocked
+            .iter()
+            .any(|cidr| cidr.contains("8.8.8.8".parse().unwrap())));
+    }
+
+    #[test]
+    fn advisory_dns_does_not_relax_global_tun_or_node_verification() {
+        let controller = serde_json::json!({"mode":"global", "tun":{
+            "enable":true,"device":"utun6","dns-hijack":["any:53"]}});
+        require_tun_controller(&controller).unwrap();
+        let mut bad = controller.clone();
+        bad["mode"] = serde_json::json!("rule");
+        assert!(require_tun_controller(&bad).is_err());
+        bad = controller.clone();
+        bad["tun"]["enable"] = serde_json::json!(false);
+        assert!(require_tun_controller(&bad).is_err());
+        bad = controller.clone();
+        bad["tun"]["device"] = serde_json::json!("en0");
+        assert!(require_tun_controller(&bad).is_err());
+        bad = controller;
+        bad["tun"]["dns-hijack"] = serde_json::json!([]);
+        assert!(require_tun_controller(&bad).is_err());
+        let guard = fixture();
+        let mut live = Observed {
+            interface: guard.interface.clone(),
+            chain: guard.selected_chain.clone(),
+            server: guard.server.clone(),
+            port: guard.port,
+            protocols: guard.protocols.clone(),
+            dns_note: UNCONFIRMED_DNS_NOTE.into(),
+            dns_pins: vec![],
+        };
+        endpoint_matches(&guard, &live).unwrap();
+        live.port += 1;
+        assert!(endpoint_matches(&guard, &live).is_err());
+    }
+
     #[test]
     fn dns_pin_keeps_a_different_port_on_the_same_server() {
         let main = vec!["tcp".to_string()];

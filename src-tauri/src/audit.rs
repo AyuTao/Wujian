@@ -211,8 +211,72 @@ impl Logger {
 /// Classify locally; the input itself is never serialized.
 pub fn error_kind(error: &str) -> &'static str {
     let lower = error.to_lowercase();
+    // Installer errors also cross osascript into the App log. Keep the stage
+    // even when a failed helper cannot export its own root-only logs.
+    if lower.contains("管理组件独立签名") {
+        return "helper_signature_failed";
+    }
+    if lower.contains("管理组件所有权") {
+        return "helper_ownership_failed";
+    }
+    if lower.contains("管理组件启动注册失败") {
+        return if lower.contains("退出码 5）") {
+            "helper_bootstrap_exit_5"
+        } else {
+            "helper_bootstrap_failed"
+        };
+    }
+    if lower.contains("管理组件启用失败") {
+        return "helper_enable_failed";
+    }
+    if lower.contains("管理组件停止") {
+        return "helper_unload_failed";
+    }
+    if lower.contains("管理组件启动验证失败") {
+        return "helper_startup_unconfirmed";
+    }
     if error == "前端异常" {
         return "frontend_exception";
+    }
+    if lower.contains("管理组件") && (lower.contains("版本过旧") || lower.contains("更新未确认"))
+    {
+        return "helper_version_mismatch";
+    }
+    if lower.contains("操作结果未确认") {
+        return "operation_result_unknown";
+    }
+    for (message, kind) in [
+        ("代理 dns 未开启", "dns_proxy_disabled"),
+        ("dns 主解析上游为空或格式无法读取", "dns_primary_missing"),
+        ("dns 配置格式无法核对", "dns_config_invalid"),
+        ("dns 未指定代理出口", "dns_proxy_unspecified"),
+        ("dns 显式选择了直连出口", "dns_explicit_direct"),
+        ("dns 的代理策略或接口无法确认", "dns_route_unconfirmed"),
+        (
+            "当前保护仅支持使用公网 ipv4 的 https dns",
+            "dns_upstream_format",
+        ),
+        (
+            "dns 遵循路由规则，但当前全局模式尚未确认",
+            "dns_rules_mode_unconfirmed",
+        ),
+        ("未配置 proxy-server-nameserver", "dns_bootstrap_missing"),
+    ] {
+        if lower.contains(message) {
+            return kind;
+        }
+    }
+    if lower.contains("tun 没有劫持 53") {
+        return "dns_hijack_missing";
+    }
+    if lower.contains("国外 dns 必须写成") {
+        return "dns_upstream_format";
+    }
+    if lower.contains("国外域名的 dns 仍走直连") {
+        return "dns_route_unconfirmed";
+    }
+    if lower.contains("请先开启代理 dns") {
+        return "dns_proxy_disabled";
     }
     if lower.contains("节点端点发生变化") {
         return "tunnel_plan_changed";
@@ -628,6 +692,43 @@ mod tests {
         assert!(entry.operation_id.is_none());
         assert_eq!(error_kind("管理员授权已取消"), "admin_cancelled");
         assert_eq!(error_kind("管理组件未响应"), "helper_unavailable");
+        assert_eq!(
+            error_kind("系统操作失败：管理组件启动注册失败（bootstrap，退出码 5）；请导出日志 (1)"),
+            "helper_bootstrap_exit_5"
+        );
+        assert_eq!(
+            error_kind("管理组件独立签名验证失败"),
+            "helper_signature_failed"
+        );
+        assert_eq!(
+            error_kind("管理组件所有权或权限核验失败"),
+            "helper_ownership_failed"
+        );
+        assert_eq!(
+            error_kind("管理组件启动验证失败；安装文件已保留"),
+            "helper_startup_unconfirmed"
+        );
+
+        assert_eq!(
+            error_kind("后台管理组件版本过旧"),
+            "helper_version_mismatch"
+        );
+        assert_eq!(
+            error_kind("管理组件回执中断；操作结果未确认"),
+            "operation_result_unknown"
+        );
+        assert_eq!(
+            error_kind("TUN 没有劫持 53 端口，系统 DNS 可能绕过代理直连"),
+            "dns_hijack_missing"
+        );
+        assert_eq!(
+            error_kind("国外 DNS 必须写成 https://公网IPv4/…#策略组，不能直连"),
+            "dns_upstream_format"
+        );
+        assert_eq!(
+            error_kind("国外域名的 DNS 仍走直连或未确认路径，查询会从本机出去"),
+            "dns_route_unconfirmed"
+        );
         assert_eq!(error_kind("HTTP 503"), "http_status");
         assert_eq!(error_kind("请求超时"), "timeout");
     }

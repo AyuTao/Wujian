@@ -8,6 +8,7 @@ import type {
   FirewallPlan,
   FirewallReceipt,
   TimezoneInfo,
+  RegionInfo,
   DiagnosticEntry,
 } from "./types";
 import { redactReport } from "./report";
@@ -62,7 +63,7 @@ let demo: AppSnapshot = {
   tools: demoTools,
   checks: [],
   platform: "桌面预览",
-  version: "0.1.0-beta.1",
+  version: "0.1.0-beta.2",
   networkEpoch: 0,
   observedAt: now(),
   proxySummary: "演示路径，未读取本机配置",
@@ -320,6 +321,22 @@ export async function applyOverseasDns(): Promise<void> {
 export async function followEgressTimezone(): Promise<TimezoneInfo> {
   if (!isNative()) throw new Error("跟随出口时区只能在桌面应用中执行。");
   return invoke<TimezoneInfo>("follow_egress_timezone");
+}
+export async function getSystemRegion(): Promise<RegionInfo> {
+  if (!isNative()) throw new Error("系统地区只能在桌面应用中读取。");
+  return invoke<RegionInfo>("get_system_region");
+}
+export async function followEgressRegion(): Promise<RegionInfo> {
+  if (!isNative()) throw new Error("地区跟随只能在桌面应用中执行。");
+  return invoke<RegionInfo>("follow_egress_region");
+}
+export async function restoreSystemRegion(): Promise<RegionInfo> {
+  if (!isNative()) throw new Error("系统地区只能在桌面应用中恢复。");
+  return invoke<RegionInfo>("restore_system_region");
+}
+export async function openSystemRegionSettings(): Promise<void> {
+  if (!isNative()) throw new Error("请在系统设置中打开语言与地区。");
+  return invoke<void>("open_system_region_settings");
 }
 export async function getDiagnosticLogs(): Promise<DiagnosticEntry[]> {
   return isNative() ? invoke<DiagnosticEntry[]>("get_diagnostic_logs") : [];

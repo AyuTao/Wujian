@@ -62,6 +62,17 @@ export interface Settings {
   autoArm?: boolean;
 }
 
+export interface RegionInfo {
+  current: string | null;
+  original: string | null;
+  canRestore: boolean;
+  followingEnabled: boolean;
+  followsEgress: boolean;
+  restartRequired: boolean;
+  backend: string;
+  detail: string;
+}
+
 export interface TimezoneInfo {
   current: string;
   original: string | null;
@@ -89,6 +100,13 @@ export interface CircuitBreakerReport {
   gates: GateCheck[];
 }
 
+export interface PhysicalDns {
+  adapters: { service: string; automatic: boolean; servers: string[] }[];
+  observedAt: string;
+  error: string | null;
+  runtimeOnly: boolean;
+}
+
 export interface AppSnapshot {
   tools: ToolInfo[];
   checks: CheckResult[];
@@ -98,6 +116,7 @@ export interface AppSnapshot {
   observedAt: string;
   proxySummary: string;
   dnsServers: string[];
+  physicalDns?: PhysicalDns;
   settings: Settings;
   events: HistoryEvent[];
   isDisguised?: boolean;
@@ -110,6 +129,7 @@ export interface CheckReport {
   networkEpoch: number;
   proxySummary: string;
   dnsServers: string[];
+  physicalDns?: PhysicalDns;
   circuitBreaker?: CircuitBreakerReport;
 }
 

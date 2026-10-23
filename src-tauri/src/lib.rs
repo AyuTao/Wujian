@@ -15,6 +15,7 @@ pub mod recovery;
 mod safety;
 mod shortcuts;
 mod store;
+mod system_region;
 mod timezone_follow;
 
 use models::*;
@@ -49,6 +50,7 @@ pub static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLo
 
 struct Runtime {
     timezone_follow: timezone_follow::FollowState,
+    region_follow: system_region::FollowState,
     data: StoredData,
     tools: Vec<ToolInfo>,
     checks: Vec<CheckResult>,
@@ -145,6 +147,7 @@ fn snapshot(runtime: &Runtime, network: &platform::NetworkInfo) -> AppSnapshot {
         observed_at: chrono::Utc::now().to_rfc3339(),
         proxy_summary: network.proxy_summary.clone(),
         dns_servers: network.dns_servers.clone(),
+        physical_dns: network.physical_dns.clone(),
         settings: runtime.data.settings.clone(),
         events: runtime.data.events.clone(),
         is_disguised: FIREWALL_ACTIVE.load(Ordering::SeqCst),
@@ -352,8 +355,9 @@ fn current_decision(rt: &Runtime) -> CircuitBreakerReport {
     )
 }
 fn native_timezone_evidence(checks: &mut Vec<CheckResult>, rt: &Runtime) {
-    checks.retain(|c| c.id != "timezone-follow");
+    checks.retain(|c| c.id != "timezone-follow" && c.id != "system-region");
     checks.push(rt.timezone_follow.check(checks));
+    checks.push(rt.region_follow.check());
 }
 fn sync_tunnel_status(rt: &mut Runtime) {
     let Some(policy) = rt.protection.tunnel_policy.as_ref() else {
@@ -677,6 +681,7 @@ async fn run_checks_inner(
             network_epoch: rt.epoch,
             proxy_summary: latest.proxy_summary.clone(),
             dns_servers: latest.dns_servers.clone(),
+            physical_dns: latest.physical_dns.clone(),
             circuit_breaker: current_decision(&rt),
         }
     };
@@ -929,7 +934,9 @@ async fn prepare_firewall(
     let policy = receipt.guard_policy.ok_or("未返回可核验的隧道计划")?;
     policy.validate()?;
     let guard = policy.tunnel_guard.as_ref().ok_or("未确认全局 TUN")?;
-    let dns_path = if guard.dns_pins.is_empty() {
+    let dns_path = if !guard.dns_note.is_empty() {
+        "DNS 配置存在提示，见下方说明。"
+    } else if guard.dns_pins.is_empty() {
         "国外 DNS 走该节点。"
     } else {
         "国外 DNS 使用了另一个节点，其地址和端口一并放行。"
@@ -1326,6 +1333,134 @@ fn export_report(report_json: String, state: State<'_, AppState>) -> Result<Stri
     })
 }
 
+async fn follow_region(
+    state: &AppState,
+    explicit: bool,
+) -> Result<Option<system_region::RegionInfo>, String> {
+    let _op = state.op_lock.lock().await;
+    let target = {
+        let mut rt = state.lock()?;
+        if rt.protection.isolation_pending || rt.running {
+            return Ok(None);
+        }
+        let ip = if explicit {
+            rt.timezone_follow
+                .location
+                .as_ref()
+                .map(|location| location.ip.clone())
+        } else {
+            rt.checks
+                .iter()
+                .find(|check| {
+                    check.id == "egress-ipv4"
+                        && check.integrity == "tls_verified"
+                        && safety::fresh(check, chrono::Utc::now())
+                })
+                .map(|check| check.value.clone())
+        };
+        let target = rt
+            .timezone_follow
+            .location
+            .as_ref()
+            .filter(|location| Some(&location.ip) == ip.as_ref())
+            .and_then(|location| location.country.clone());
+        let key = ip.as_deref().unwrap_or("");
+        if !explicit && !rt.region_follow.due(key, target.as_deref()) {
+            return Ok(None);
+        }
+        rt.region_follow.begin(key, target.as_deref());
+        target
+    };
+    let result = audit::record_async(
+        "region.follow",
+        system_region::follow(state.dir.clone(), target, explicit),
+    )
+    .await;
+    let mut rt = state.lock()?;
+    match &result {
+        Ok(info) => {
+            rt.region_follow.info = Some(info.clone());
+            rt.region_follow.error = None;
+        }
+        Err(error) => {
+            rt.region_follow.error = Some(error.clone());
+        }
+    }
+    result.map(Some)
+}
+
+#[tauri::command]
+async fn get_system_region(
+    state: State<'_, AppState>,
+) -> Result<system_region::RegionInfo, String> {
+    let target = {
+        let rt = state.lock()?;
+        rt.timezone_follow
+            .location
+            .as_ref()
+            .filter(|location| {
+                rt.checks.iter().any(|check| {
+                    check.id == "egress-ipv4"
+                        && check.value == location.ip
+                        && check.integrity == "tls_verified"
+                        && safety::fresh(check, chrono::Utc::now())
+                })
+            })
+            .and_then(|location| location.country.clone())
+    };
+    let info = audit::record_async(
+        "region.read",
+        system_region::status(state.dir.clone(), target),
+    )
+    .await?;
+    state.lock()?.region_follow.info = Some(info.clone());
+    Ok(info)
+}
+#[tauri::command]
+async fn follow_egress_region(
+    state: State<'_, AppState>,
+) -> Result<system_region::RegionInfo, String> {
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    let _probe = state.probe_lock.lock().await;
+    let (settings, revision) = {
+        let rt = state.lock()?;
+        (rt.data.settings.clone(), rt.settings_revision)
+    };
+    let before = platform::inspect().await;
+    let location = probes::egress_timezone(&settings, &before).await;
+    let after = platform::inspect().await;
+    if before.fingerprint != after.fingerprint {
+        return Err("查询期间网络配置已变化，未修改系统地区".into());
+    }
+    {
+        let mut rt = state.lock()?;
+        if rt.settings_revision != revision {
+            return Err("查询期间检测设置已变化，未修改系统地区".into());
+        }
+        rt.timezone_follow.location = location.ok();
+    }
+    // Unknown egress is shown as a recommendation, never a guessed country.
+    follow_region(state.inner(), true)
+        .await?
+        .ok_or_else(|| "当前正在检测或隔断，请稍后跟随地区".into())
+}
+#[tauri::command]
+async fn restore_system_region(
+    state: State<'_, AppState>,
+) -> Result<system_region::RegionInfo, String> {
+    let _op = state.op_lock.lock().await;
+    let info =
+        audit::record_async("region.restore", system_region::restore(state.dir.clone())).await?;
+    let mut rt = state.lock()?;
+    rt.region_follow.info = Some(info.clone());
+    rt.region_follow.error = None;
+    Ok(info)
+}
+#[tauri::command]
+async fn open_system_region_settings() -> Result<(), String> {
+    system_region::open_settings().await
+}
+
 #[tauri::command]
 fn get_system_timezone(state: State<'_, AppState>) -> Result<TimezoneInfo, String> {
     let result: Result<_, String> = (|| {
@@ -1409,10 +1544,26 @@ async fn follow_timezone(
         {
             return Ok(None);
         }
-        let cached = if !force && rt.timezone_follow.ip == ip {
+        let cached = if !force
+            && rt.timezone_follow.ip == ip
+            && rt
+                .timezone_follow
+                .location
+                .as_ref()
+                .is_some_and(|location| location.country.is_some())
+        {
             ip.clone()
                 .zip(rt.timezone_follow.target.clone())
-                .map(|(ip, timezone)| probes::EgressTimezone { ip, timezone })
+                .map(|(ip, timezone)| probes::EgressTimezone {
+                    country: rt
+                        .timezone_follow
+                        .location
+                        .as_ref()
+                        .filter(|location| location.ip == ip)
+                        .and_then(|location| location.country.clone()),
+                    ip,
+                    timezone: Some(timezone),
+                })
         } else {
             None
         };
@@ -1455,25 +1606,41 @@ async fn follow_timezone(
             }
             return Err(error);
         }
+        {
+            let mut rt = state.lock()?;
+            if rt.settings_revision != revision {
+                return Err("查询期间检测设置已变化，未修改地区或时区".into());
+            }
+            rt.timezone_follow.location = Some(target.clone());
+        }
+        // Region uses current-user settings and can succeed independently of
+        // privileged timezone changes. Its errors remain visible in its own check.
+        if let Err(error) = follow_region(state, false).await {
+            audit::transition("region.follow", "error", Some(&error));
+        }
         // The first privileged change asks once and installs the resident admin helper.
         // Later timezone, protection, DNS, and IPv6 calls use it and do not prompt.
         let app_data = state.dir.clone();
         if allow_prompt {
             admin_helper::clear_declined(&app_data);
         }
-        let result = apply_timezone(
-            target.timezone.clone(),
-            state,
-            Some(revision),
-            Some(target.ip.clone()),
-            allow_prompt,
-        )
-        .await;
+        let result = if let Some(timezone) = target.timezone.clone() {
+            apply_timezone(
+                timezone,
+                state,
+                Some(revision),
+                Some(target.ip.clone()),
+                allow_prompt,
+            )
+            .await
+        } else {
+            Err("出口城市时区未知，已保留系统时区；地区独立处理".into())
+        };
         if let Err(error) = &result {
             let mut rt = state.lock()?;
             if rt.settings_revision == revision {
                 rt.timezone_follow.error = Some(error.clone());
-                if !error.contains("未响应") {
+                if target.timezone.is_some() && !error.contains("未响应") {
                     rt.timezone_follow.application_blocked = true;
                 }
             }
@@ -1673,6 +1840,7 @@ async fn restore_all_network(state: State<'_, AppState>) -> Result<CheckReport, 
     audit::record_async("network.restore", async {
         firewall_action("release".into(), None, true, state.clone()).await?;
         restore_system_timezone(state.clone()).await?;
+        restore_system_region(state.clone()).await?;
         run_checks(0, Some("operation".into()), state).await
     })
     .await
@@ -1692,89 +1860,61 @@ async fn configure_dns(servers: Vec<String>, state: State<'_, AppState>) -> Resu
                 .map(|s| s.parse().map_err(|_| "DNS 地址无效".to_string()))
                 .collect::<Result<_, _>>()?,
         };
-        change.validate()?;
-        // Probe before ANY mutation; a missing local resolver cannot take down DNS.
-        for server in &change.servers {
-            audit::record_async("dns.preflight", network_dns::probe(*server)).await?;
-        }
-        let _op = state.op_lock.lock().await;
-        {
-            let mut rt = state.lock()?;
-            if rt.protection.armed || rt.protection.isolation_pending {
-                return Err("请先停止守护并恢复网络，再修改 DNS".into());
-            }
-            rt.protection.dns_modified = true;
-            rt.protection.save(&state.dir)?;
-        }
-        let result = native_request(
-            state.inner(),
-            firewall::Request {
-                operation_id: None,
-                guard_user: None,
-                dns: Some(change),
-                action: "network-apply".into(),
-                policy: None,
-                acknowledge_connection_reset: false,
-            },
-        )
-        .await;
-        if let Err(e) = result {
-            let mut rt = state.lock()?;
-            rt.protection.error = Some(e.clone());
-            rt.protection.save(&state.dir)?;
-            return Err(e);
-        }
-        let mut rt = state.lock()?;
-        rt.protection.error = None;
-        rt.protection.save(&state.dir)?;
-        Ok(())
+        persist_system_dns(change, state.inner()).await
     })
     .await
 }
+
+/// Both settings and the quick action are explicit, persistent user choices.
+/// A pending/uncertain write remains recoverable; stopping protection only
+/// restores those incomplete or legacy transactions, never a committed choice.
+async fn persist_system_dns(change: network_dns::Change, state: &AppState) -> Result<(), String> {
+    change.validate()?;
+    for server in &change.servers {
+        audit::record_async("dns.preflight", network_dns::probe(*server)).await?;
+    }
+    let _op = state.op_lock.lock().await;
+    {
+        let mut rt = state.lock()?;
+        if rt.protection.armed || rt.protection.isolation_pending {
+            return Err("请先停止守护并恢复网络，再修改 DNS".into());
+        }
+        if recovery::load_recovery_record(&state.dir)?.is_some() {
+            return Err("请先恢复旧版本配置，再修改系统 DNS，避免旧备份覆盖新值".into());
+        }
+        rt.protection.dns_modified = true;
+        rt.protection.save(&state.dir)?;
+    }
+    let result = native_request(
+        state,
+        firewall::Request {
+            operation_id: None,
+            guard_user: None,
+            dns: Some(change),
+            action: "network-apply-keep".into(),
+            policy: None,
+            acknowledge_connection_reset: false,
+        },
+    )
+    .await;
+    let mut rt = state.lock()?;
+    // A transport failure may occur after a native write. Keep the pending flag
+    // until success is acknowledged or the user explicitly restores it.
+    rt.protection.complete_dns_write(&result);
+    rt.protection.save(&state.dir)?;
+    result.map(|_| ())
+}
+
 #[tauri::command]
 async fn apply_overseas_dns(state: State<'_, AppState>) -> Result<(), String> {
     audit::record_async("dns.overseas", async {
-        let change = network_dns::Change {
-            servers: network_dns::overseas_system_dns(),
-        };
-        change.validate()?;
-        let _op = state.op_lock.lock().await;
-        // Flag the write before the helper runs. A crash mid-change can still
-        // restore. Success clears it so stopping protection leaves 1.1.1.1.
-        let was_modified = {
-            let mut rt = state.lock()?;
-            let was = rt.protection.dns_modified;
-            rt.protection.dns_modified = true;
-            rt.protection.save(&state.dir)?;
-            was
-        };
-        let result = native_request(
-            state.inner(),
-            firewall::Request {
-                operation_id: None,
-                guard_user: None,
-                dns: Some(change),
-                action: "network-apply-keep".into(),
-                policy: None,
-                acknowledge_connection_reset: false,
+        persist_system_dns(
+            network_dns::Change {
+                servers: network_dns::overseas_system_dns(),
             },
+            state.inner(),
         )
-        .await;
-        let mut rt = state.lock()?;
-        match result {
-            Ok(_) => {
-                rt.protection.dns_modified = false;
-                rt.protection.save(&state.dir)?;
-                Ok(())
-            }
-            Err(e) => {
-                if !e.contains("原始记录已保留") {
-                    rt.protection.dns_modified = was_modified;
-                }
-                rt.protection.save(&state.dir)?;
-                Err(e)
-            }
-        }
+        .await
     })
     .await
 }
@@ -2083,6 +2223,7 @@ pub fn run() {
             app.manage(AppState {
                 inner: Mutex::new(Runtime {
                     timezone_follow: timezone_follow::FollowState::default(),
+                    region_follow: system_region::FollowState::default(),
                     data,
                     tools,
                     checks: vec![],
@@ -2110,6 +2251,9 @@ pub fn run() {
                     let Ok(_probe) = state.probe_lock.try_lock() else { continue; };
                     if let Err(error) = follow_timezone(state.inner(), false, false).await {
                         audit::event("timezone.follow", "error", Some(&error), None);
+                    }
+                    if let Err(error) = follow_region(state.inner(), false).await {
+                        audit::transition("region.follow", "error", Some(&error));
                     }
                 }
             });
@@ -2207,6 +2351,10 @@ pub fn run() {
             export_report,
             prepare_firewall,
             firewall_action,
+            get_system_region,
+            follow_egress_region,
+            restore_system_region,
+            open_system_region_settings,
             get_system_timezone,
             follow_egress_timezone,
             set_system_timezone,

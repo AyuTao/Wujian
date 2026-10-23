@@ -313,9 +313,11 @@ fn lookup_country(settings: &Settings, ip: IpAddr) -> Result<crate::geo::Country
     result
 }
 
+#[derive(Clone)]
 pub(crate) struct EgressTimezone {
     pub ip: String,
-    pub timezone: String,
+    pub timezone: Option<String>,
+    pub country: Option<String>,
 }
 pub(crate) async fn verified_egress_ip(
     settings: &Settings,
@@ -330,41 +332,91 @@ pub(crate) async fn verified_egress_ip(
 }
 
 /// Queried on explicit follow or after an IP change when follow mode is enabled.
-/// ipinfo's timezone matched the measured Seattle facility for this egress.
-/// ipwho.is registered that same address in Buffalo and is only a fallback.
+/// Prefer the primary IP-bound city record; the fallback can fill missing
+/// country/timezone metadata. Conflicting country records remain unknown.
 pub(crate) async fn egress_timezone(
     settings: &Settings,
     network: &NetworkInfo,
 ) -> Result<EgressTimezone, String> {
     let ip = verified_egress_ip(settings, network).await?;
     let http = client(settings, None)?;
-    let timezone = match crate::audit::record_async("timezone.lookup.ipinfo", async {
+    let primary = crate::audit::record_async("timezone.lookup.ipinfo", async {
         let response = json_request(&http, &format!("https://ipinfo.io/{ip}/json")).await?;
-        timezone_from_ipinfo(&response, ip)
+        location_from_ipinfo(&response, ip)
     })
-    .await
-    {
-        Ok(timezone) => timezone,
-        Err(_) => {
+    .await;
+    let location = match primary {
+        Ok(location) if location.timezone.is_some() && location.country.is_some() => location,
+        partial => {
             crate::audit::event("timezone.lookup", "fallback", None, None);
-            crate::audit::record_async("timezone.lookup.ipwho", timezone_from_ipwho(&http, ip))
-                .await?
+            match crate::audit::record_async(
+                "timezone.lookup.ipwho",
+                location_from_ipwho(&http, ip),
+            )
+            .await
+            {
+                Ok(fallback) => match partial {
+                    Ok(mut location) => {
+                        if location.timezone.is_none() {
+                            location.timezone = fallback.timezone;
+                        }
+                        location.country = match (location.country, fallback.country) {
+                            (Some(a), Some(b)) if a != b => None,
+                            (Some(a), _) => Some(a),
+                            (None, country) => country,
+                        };
+                        location
+                    }
+                    Err(_) => fallback,
+                },
+                Err(error) => partial.map_err(|_| error)?,
+            }
         }
     };
     if verified_egress_ip(settings, network).await? != ip {
         return Err("查询期间出口 IP 已变化，请重试；未修改时区".into());
     }
-    Ok(EgressTimezone {
-        ip: ip.to_string(),
-        timezone,
-    })
+    Ok(location)
 }
 
-async fn timezone_from_ipwho(client: &Client, ip: IpAddr) -> Result<String, String> {
-    let response = json_request(client, &format!("https://ipwho.is/{ip}"))
-        .await
-        .map_err(|e| format!("城市时区查询失败：{e}；未修改时区"))?;
-    timezone_from_response(&response, ip)
+fn country_from_response(value: &serde_json::Value, key: &str) -> Option<String> {
+    value[key]
+        .as_str()
+        .filter(|country| crate::system_region::valid_country(country))
+        .map(str::to_owned)
+}
+fn location_from_ipinfo(value: &serde_json::Value, ip: IpAddr) -> Result<EgressTimezone, String> {
+    if value.get("error").is_some()
+        || value["ip"].as_str().and_then(|s| s.parse::<IpAddr>().ok()) != Some(ip)
+    {
+        return Err("出口地区查询未返回当前 IP 的有效记录".into());
+    }
+    let location = EgressTimezone {
+        ip: ip.to_string(),
+        timezone: timezone_from_ipinfo(value, ip).ok(),
+        country: country_from_response(value, "country"),
+    };
+    if location.timezone.is_none() && location.country.is_none() {
+        return Err("出口地区与时区均未确认".into());
+    }
+    Ok(location)
+}
+async fn location_from_ipwho(client: &Client, ip: IpAddr) -> Result<EgressTimezone, String> {
+    let value = json_request(client, &format!("https://ipwho.is/{ip}")).await?;
+    if value["success"] != true
+        || value["ip"].as_str().and_then(|s| s.parse::<IpAddr>().ok()) != Some(ip)
+    {
+        return Err("出口地区查询未返回当前 IP 的有效记录".into());
+    }
+    let location = EgressTimezone {
+        ip: ip.to_string(),
+        timezone: timezone_from_response(&value, ip).ok(),
+        country: country_from_response(&value, "country_code"),
+    };
+    if location.timezone.is_none() && location.country.is_none() {
+        return Err("出口地区与时区均未确认".into());
+    }
+    Ok(location)
 }
 
 fn timezone_from_ipinfo(value: &serde_json::Value, ip: IpAddr) -> Result<String, String> {
@@ -511,6 +563,28 @@ async fn probe_dns(settings: &Settings, _network: &NetworkInfo) -> Vec<CheckResu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn region_metadata_is_ip_bound_and_independent_of_city_timezone() {
+        let ip = "203.0.113.1".parse().unwrap();
+        let location = super::location_from_ipinfo(
+            &serde_json::json!({"ip":"203.0.113.1","country":"US"}),
+            ip,
+        )
+        .unwrap();
+        assert_eq!(location.country.as_deref(), Some("US"));
+        assert!(location.timezone.is_none());
+        assert!(super::location_from_ipinfo(
+            &serde_json::json!({"ip":"203.0.113.2","country":"US"}),
+            ip
+        )
+        .is_err());
+        assert!(super::location_from_ipinfo(
+            &serde_json::json!({"ip":"203.0.113.1","country":"ZZ"}),
+            ip
+        )
+        .is_err());
+    }
+
     use super::*;
     #[test]
     fn timezone_lookup_requires_the_exact_egress_and_an_iana_city_record() {
@@ -596,6 +670,7 @@ mod tests {
         };
         let network = NetworkInfo {
             dns_servers: vec![],
+            physical_dns: Default::default(),
             proxy_summary: String::new(),
             checks: vec![],
             fingerprint: 0,

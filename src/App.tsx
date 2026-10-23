@@ -1,3 +1,4 @@
+import { regionName } from "./lib/regionDisplay";
 import { useEffect, useRef, useState } from "react";
 import * as Flags from "country-flag-icons/react/3x2";
 import {
@@ -21,7 +22,7 @@ import { notifyError, notifyOk } from "./lib/notify";
 import { needsProtectionRecovery } from "./lib/protection";
 import SettingsDialog from "./components/SettingsDialog";
 import { dnsDisplay, dnsEndpoint } from "./lib/dnsDisplay";
-import { mainlandPublicDns } from "./lib/systemDns";
+import { mainlandPublicDns, physicalDnsDisplay } from "./lib/systemDns";
 import { egressDisplay, hasEgressAddress } from "./lib/egressDisplay";
 
 const native = isNative();
@@ -299,13 +300,14 @@ export default function App() {
 
   const checks = snapshot?.checks ?? [];
   const region = checks.find((c) => c.id === "egress-region");
+  const systemRegion = checks.find((c) => c.id === "system-region");
+  const regionNeedsAttention = systemRegion?.status === "review";
   const ipCheck = checks.find(
     (c) => c.id === "egress-ipv4" || c.id === "egress-ip",
   );
 
   const g1 = gates.find((g) => g.id === "gate-ip");
   const g2 = gates.find((g) => g.id === "gate-timezone");
-  const g3 = gates.find((g) => g.id === "gate-dns");
   const g4 = gates.find((g) => g.id === "gate-ipv6");
   const g5 = gates.find((g) => g.id === "gate-tunnel");
   const g6 = gates.find((g) => g.id === "gate-mode");
@@ -313,10 +315,11 @@ export default function App() {
     g6?.passed &&
     checks.find((check) => check.id === "proxy-mode")?.status === "match",
   );
-  const mainlandDns = mainlandPublicDns(snapshot?.dnsServers ?? []);
-  const dnsConfigPassed = Boolean(
-    g3?.passed && snapshot?.dnsServers.length && mainlandDns.length === 0,
+  const physicalDns = physicalDnsDisplay(
+    snapshot?.physicalDns,
+    snapshot?.dnsServers,
   );
+  const dnsConfigKnown = physicalDns.readable;
   const vergeInstalled =
     checks.find((check) => check.id === "clash-verge-app")?.status === "match";
   const vergeLabel =
@@ -430,18 +433,34 @@ export default function App() {
 
             {/* 2. 时区：跟随出口 IP */}
             <div
-              className={`${styles.itemCardRow} ${g2?.passed ? styles.rowPass : styles.rowFail}`}
-              title={g2?.detail}
+              className={`${styles.itemCardRow} ${g2?.passed && !regionNeedsAttention ? styles.rowPass : styles.rowFail}`}
+              title={[
+                g2?.detail,
+                checks.find((check) => check.id === "system-region")?.detail,
+              ]
+                .filter(Boolean)
+                .join("；")}
             >
-              <span className={styles.rowColTitle}>时区</span>
-              <div className={styles.rowColData}>
+              <span className={styles.rowColTitle}>
+                时区
+                <br />
+                地区
+              </span>
+              <div className={`${styles.rowColData} ${styles.environmentData}`}>
                 <span
                   className={
                     g2?.passed ? styles.dataPassColor : styles.dataFailColor
                   }
                 >
                   {currentTimezone || "未知时区"}
-                  {" · 跟随出口"}
+                </span>
+                <span className={styles.regionDetail}>
+                  地区：{regionName(systemRegion?.value)}
+                  {regionNeedsAttention
+                    ? " · 建议修改"
+                    : systemRegion?.status === "match"
+                      ? " · 跟随出口"
+                      : " · 保留当前"}
                 </span>
               </div>
               <div className={styles.rowColAction}>
@@ -452,16 +471,18 @@ export default function App() {
                     setSettingsSection("timezone");
                     setShowSettings(true);
                   }}
-                  title="时区跟随出口 IP"
+                  title="时区与系统地区跟随出口 IP"
                 >
-                  设置
+                  {regionNeedsAttention ? "修改地区" : "设置"}
                 </button>
               </div>
               <div className={styles.rowColStamp}>
-                {g2?.passed ? (
+                {g2?.passed && !regionNeedsAttention ? (
                   <span className={styles.redStampPass}>PASS</span>
                 ) : (
-                  <span className={styles.stampPending}>FAIL</span>
+                  <span className={styles.stampPending}>
+                    {regionNeedsAttention ? "提示" : "FAIL"}
+                  </span>
                 )}
               </div>
             </div>
@@ -505,7 +526,7 @@ export default function App() {
             </div>
 
             <div
-              className={`${styles.itemCardRow} ${dnsConfigPassed ? styles.rowPass : styles.rowFail}`}
+              className={`${styles.itemCardRow} ${dnsConfigKnown ? styles.rowPass : styles.rowFail}`}
             >
               <span
                 className={`${styles.rowColTitle} ${styles.dnsConfigTitle}`}
@@ -513,38 +534,48 @@ export default function App() {
                 DNS配置
               </span>
               <div
-                className={styles.rowColData}
-                title={snapshot?.dnsServers.join("、")}
+                className={`${styles.rowColData} ${styles.environmentData}`}
+                title={`${physicalDns.detail}。${snapshot?.physicalDns?.runtimeOnly ? "Linux 为运行时网卡值" : "网卡为保存的静态值"}；生效入口可能含 TUN / VPN。最近读取：${snapshot?.physicalDns?.observedAt || "未知"}。配置只作参考，不作为保护允许条件。`}
               >
                 <span
                   className={
-                    dnsConfigPassed
-                      ? styles.dataPassColor
-                      : styles.dataFailColor
+                    dnsConfigKnown ? styles.dataPassColor : styles.dataFailColor
                   }
                 >
-                  {snapshot?.dnsServers.join("、") || "解析入口未知"}
+                  网卡：{physicalDns.text}
+                </span>
+                <span className={styles.regionDetail}>
+                  生效：{snapshot?.dnsServers.join("、") || "解析入口未知"}
                 </span>
               </div>
               <div className={styles.rowColAction}>
-                {mainlandDns.length > 0 && (
+                {physicalDns.offerOverseas && (
                   <button
                     className={`${styles.btnGateToggle} ${styles.btnGateActive}`}
-                    disabled={busy || !snapshot}
+                    disabled={busy || !snapshot || isArmed || isTripped}
                     onClick={() =>
                       void perform("dns", async () => {
                         await applyOverseasDns();
                         const next = await getSnapshot();
                         await runChecks(next.networkEpoch, "settings");
                         const updated = await getSnapshot();
+                        const current = physicalDnsDisplay(updated.physicalDns);
                         notifyOk(
-                          mainlandPublicDns(updated.dnsServers).length
-                            ? "已写入 1.1.1.1、1.0.0.1，国内 DNS 仍在"
-                            : "已改为 1.1.1.1、1.0.0.1",
+                          !current.readable
+                            ? "DNS 写入已确认，但当前状态读取失败，请重新核验"
+                            : current.mainland.length
+                              ? "DNS 已提交，但当前网卡又出现国内地址；请检查其他程序是否覆盖"
+                              : mainlandPublicDns(updated.dnsServers).length
+                                ? "网卡 DNS 已修改；系统生效入口仍含国内地址，请查看 DNS 设置"
+                                : "网卡 DNS 已改为 1.1.1.1、1.0.0.1",
                         );
                       })
                     }
-                    title="改为 1.1.1.1、1.0.0.1"
+                    title={
+                      isArmed || isTripped
+                        ? "请先停止保护，再修改网卡 DNS"
+                        : "修改物理网卡 IPv4 DNS 为 1.1.1.1、1.0.0.1，停止保护后保留；客户端可能在退出时覆盖，建议先退出客户端再修改"
+                    }
                   >
                     改海外
                   </button>
@@ -553,10 +584,10 @@ export default function App() {
               <div className={styles.rowColStamp}>
                 <span
                   className={
-                    dnsConfigPassed ? styles.redStampPass : styles.stampPending
+                    dnsConfigKnown ? styles.redStampPass : styles.stampPending
                   }
                 >
-                  {dnsConfigPassed ? "PASS" : "FAIL"}
+                  {dnsConfigKnown ? "参考" : "未知"}
                 </span>
               </div>
             </div>

@@ -55,6 +55,9 @@ async fn execute_timed(
         "powershell.exe" => "system.powershell",
         "osascript" => "system.authorize",
         "curl" | "curl.exe" => "system.controller",
+        "networksetup" => "system.networksetup",
+        "ifconfig" => "system.ifconfig",
+        "resolvectl" => "system.resolvectl",
         _ => "system.command",
     };
     let observed = Instant::now();

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(crate) struct FollowState {
+    pub location: Option<crate::probes::EgressTimezone>,
     pub ip: Option<String>,
     pub target: Option<String>,
     pub error: Option<String>,
@@ -22,7 +23,18 @@ impl FollowState {
                 .as_deref()
                 .is_some_and(|tz| platform::timezone_matches(current_timezone, tz))
         {
-            return false;
+            // Retry incomplete country metadata after the normal backoff, even
+            // when the timezone itself already matches this IP.
+            if self
+                .location
+                .as_ref()
+                .is_some_and(|location| location.country.is_some())
+                || self
+                    .attempted_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(300))
+            {
+                return false;
+            }
         }
         !(self.attempted_ip.as_deref() == Some(ip)
             && self

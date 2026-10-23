@@ -307,6 +307,13 @@ mod tests {
         ];
         assert!(!global_report(&checks, &settings, &status).all_passed);
         checks[1].status = "match".into();
+        checks.push(CheckResult::local(
+            "dns-config",
+            "系统 DNS",
+            "observed",
+            "114.114.114.114",
+            "配置地址不等于实际解析路径",
+        ));
         assert!(global_report(&checks, &settings, &status).all_passed);
         status.armed = true;
         assert!(!global_report(&checks, &settings, &status).all_passed);

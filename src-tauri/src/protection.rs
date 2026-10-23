@@ -31,6 +31,18 @@ pub struct ProtectionStatus {
     pub incident_reason: Option<String>,
 }
 impl ProtectionStatus {
+    pub fn complete_dns_write<T>(&mut self, result: &Result<T, String>) {
+        match result {
+            Ok(_) => {
+                self.dns_modified = false;
+                self.error = None;
+            }
+            Err(error) => {
+                self.dns_modified = true;
+                self.error = Some(error.clone());
+            }
+        }
+    }
     pub fn can_release_ipv6(&self) -> bool {
         self.ipv6_only && !self.armed && !self.isolation_pending && self.tunnel_policy.is_none()
     }
@@ -145,6 +157,25 @@ impl ProtectionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_acknowledged_dns_commit_clears_pending_recovery_across_restart() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut status = ProtectionStatus {
+            dns_modified: true,
+            ..Default::default()
+        };
+        status.complete_dns_write::<()>(&Err("fixture reply lost".into()));
+        status.save(&dir).unwrap();
+        let mut status = ProtectionStatus::load(&dir);
+        assert!(status.dns_modified);
+        assert_eq!(status.error.as_deref(), Some("fixture reply lost"));
+        status.complete_dns_write(&Ok::<_, String>(()));
+        status.save(&dir).unwrap();
+        let status = ProtectionStatus::load(&dir);
+        assert!(!status.dns_modified);
+        assert!(status.error.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn independent_ipv6_release_preserves_dns_and_survives_restart() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());

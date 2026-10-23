@@ -195,6 +195,7 @@ pub struct AppSnapshot {
     pub observed_at: String,
     pub proxy_summary: String,
     pub dns_servers: Vec<String>,
+    pub physical_dns: crate::network_dns::PhysicalDns,
     pub settings: Settings,
     pub events: Vec<HistoryEvent>,
     pub is_disguised: bool,
@@ -209,6 +210,7 @@ pub struct CheckReport {
     pub network_epoch: u64,
     pub proxy_summary: String,
     pub dns_servers: Vec<String>,
+    pub physical_dns: crate::network_dns::PhysicalDns,
     pub circuit_breaker: CircuitBreakerReport,
 }
 #[derive(Clone, Serialize, Deserialize)]

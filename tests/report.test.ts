@@ -43,6 +43,8 @@ describe("default report redaction", () => {
     expect(redactText("DNS 2001:db8::12")).not.toContain("2001:db8::12");
     expect(redactText("/Users/private-user/.local/bin/claude")).not.toContain(
       "private-user",
+      "private-nic-name",
+      "192.0.2.53",
     );
     expect(redactText("2026-10-21T12:00:00Z")).toBe("2026-10-21T12:00:00Z");
   });
@@ -76,6 +78,18 @@ describe("default report redaction", () => {
       observedAt: "",
       proxySummary: "",
       dnsServers: ["203.0.113.12"],
+      physicalDns: {
+        adapters: [
+          {
+            service: "private-nic-name",
+            automatic: false,
+            servers: ["192.0.2.53"],
+          },
+        ],
+        observedAt: "",
+        error: null,
+        runtimeOnly: false,
+      },
       settings: {
         theme: "system",
         externalIpConsent: false,
@@ -91,6 +105,8 @@ describe("default report redaction", () => {
     const json = JSON.stringify(redactReport(snapshot));
     for (const secret of [
       "private-user",
+      "private-nic-name",
+      "192.0.2.53",
       "/Users/private/geo/Country.mmdb",
       "secret-host",
       "203.0.113.12",

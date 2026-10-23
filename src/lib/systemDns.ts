@@ -1,3 +1,5 @@
+import type { PhysicalDns } from "./types";
+
 /** Mainland public resolvers. Loopback, LAN, and overseas DNS stay allowed. */
 const MAINLAND_PUBLIC_DNS = new Set([
   "114.114.114.114",
@@ -25,4 +27,45 @@ export function mainlandPublicDns(servers: readonly string[]): string[] {
       found.push(ip);
   }
   return found;
+}
+
+/** Saved adapter values never fall back to VPN/TUN effective resolvers. */
+export function physicalDnsDisplay(
+  physical: PhysicalDns | undefined,
+  effective: readonly string[] = [],
+) {
+  const readable = Boolean(
+    physical && !physical.error && physical.adapters.length,
+  );
+  const servers = readable
+    ? [...new Set(physical!.adapters.flatMap((adapter) => adapter.servers))]
+    : [];
+  const automatic =
+    readable && physical!.adapters.some((adapter) => adapter.automatic);
+  const text = !readable
+    ? physical?.error || "网卡配置未知"
+    : [servers.join("、"), automatic ? "自动 DNS" : ""]
+        .filter(Boolean)
+        .join(" / ");
+  const detail = !readable
+    ? text
+    : physical!.adapters
+        .map(
+          (adapter) =>
+            `${adapter.service}：${adapter.automatic ? "自动 DNS" : adapter.servers.join("、")}`,
+        )
+        .join("；");
+  const mainland = mainlandPublicDns(servers);
+  const offerOverseas = Boolean(
+    readable &&
+    (mainland.length || (automatic && mainlandPublicDns(effective).length)),
+  );
+  return {
+    readable,
+    offerOverseas,
+    servers,
+    text,
+    detail,
+    mainland,
+  };
 }

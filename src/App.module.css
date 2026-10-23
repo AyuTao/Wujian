@@ -519,3 +519,21 @@
     transition: none !important;
   }
 }
+
+.environmentData {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+.environmentData > span {
+  max-width: 100%;
+}
+.regionDetail {
+  max-width: 100%;
+  color: #94a3b8;
+  font-size: 10.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

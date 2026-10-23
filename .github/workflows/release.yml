@@ -28,10 +28,11 @@ jobs:
         run: |
           set -euo pipefail
           tag="private-test-${GITHUB_RUN_ID}"
+          version="$(node -p 'require("./package.json").version')"
           if gh release view "$tag" >/dev/null 2>&1; then
             test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
           else
-            gh release create "$tag" --target "$GITHUB_SHA" --draft --prerelease --title "Private test ${GITHUB_SHA:0:8}" --notes "Unpublished test installers for repository maintainers. Source commit: $GITHUB_SHA. Do not publish this draft."
+            gh release create "$tag" --target "$GITHUB_SHA" --draft --prerelease --title "无间道 ${version} 内部测试（${GITHUB_SHA:0:8}）" --notes-file docs/测试版发布说明.md
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 

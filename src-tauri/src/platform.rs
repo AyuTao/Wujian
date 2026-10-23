@@ -9,6 +9,7 @@ use tokio::process::Command;
 
 pub struct NetworkInfo {
     pub dns_servers: Vec<String>,
+    pub physical_dns: crate::network_dns::PhysicalDns,
     pub proxy_summary: String,
     pub checks: Vec<CheckResult>,
     pub fingerprint: u64,
@@ -284,6 +285,7 @@ fn evidence_fingerprint(signature: &str, checks: &[CheckResult]) -> u64 {
 }
 
 pub async fn inspect() -> NetworkInfo {
+    let physical_read = tokio::spawn(crate::network_dns::inspect());
     let env_proxy = [
         "https_proxy",
         "http_proxy",
@@ -518,8 +520,20 @@ pub async fn inspect() -> NetworkInfo {
     let mode = crate::proxy_core::inspect(route_tun_ok).await;
     checks.push(mode);
     let fingerprint = evidence_fingerprint(&signature, &checks);
+    let physical_dns = physical_read
+        .await
+        .unwrap_or_else(|_| crate::network_dns::PhysicalDns {
+            error: Some("物理网卡 DNS 读取中断".into()),
+            ..Default::default()
+        });
+    crate::audit::transition(
+        "dns.effective",
+        crate::network_dns::resolver_kind(&dns_servers),
+        None,
+    );
     NetworkInfo {
         dns_servers,
+        physical_dns,
         proxy_summary,
         checks,
         fingerprint,
