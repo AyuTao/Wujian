@@ -21,7 +21,16 @@
 
 当前版本：**0.1.0-beta.2**，仍在测试中。支持 macOS 14+（Apple Silicon / Intel）、Windows x64 和 Linux x64；Windows / Linux 尚需更多实机验证。
 
-安装包由 [GitHub Actions](https://github.com/AyuTao/Wujian/actions/workflows/release.yml) 编译，目前仅放在 [Releases](https://github.com/AyuTao/Wujian/releases) 的未发布草稿中，供仓库维护者下载测试，暂未提供公开下载。macOS 测试包未经 Apple 公证，Windows 测试包未做代码签名。
+**[下载最新测试版 →](https://github.com/AyuTao/Wujian/releases/tag/v0.1.0-beta.2)**
+
+| 系统                | 安装包                                                                                                                                                                                                                                                        |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mac · Apple Silicon | [DMG](https://github.com/AyuTao/Wujian/releases/download/v0.1.0-beta.2/wujian-0.1.0-beta.2-aarch64-apple-darwin.dmg)                                                                                                                                          |
+| Mac · Intel         | [DMG](https://github.com/AyuTao/Wujian/releases/download/v0.1.0-beta.2/wujian-0.1.0-beta.2-x86_64-apple-darwin.dmg)                                                                                                                                           |
+| Windows x64         | [安装程序](https://github.com/AyuTao/Wujian/releases/download/v0.1.0-beta.2/wujian-0.1.0-beta.2-x86_64-pc-windows-msvc-setup.exe)                                                                                                                             |
+| Linux x64           | [deb](https://github.com/AyuTao/Wujian/releases/download/v0.1.0-beta.2/wujian-0.1.0-beta.2-x86_64-unknown-linux-gnu.deb) · [AppImage](https://github.com/AyuTao/Wujian/releases/download/v0.1.0-beta.2/wujian-0.1.0-beta.2-x86_64-unknown-linux-gnu.AppImage) |
+
+安装包由 GitHub Actions 编译，附 SHA-256 校验文件。macOS 测试包未经 Apple 公证，Windows 测试包未做代码签名。
 
 1. 打开 App，先检查网络环境。
 2. 如需全局保护，先在 Clash Verge Rev / Mihomo 中开启 **Global + TUN**，并接管 DNS 53 端口。
